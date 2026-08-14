@@ -29,12 +29,15 @@ return {
     const sandboxPolicy = ctx.get('sandboxPolicy')
     const credentials = ctx.get('credentials')
 
-    const env = typeof process !== 'undefined' && process.env ? process.env : {}
+    // NOTE: dynamic plugin sandboxes have NO `process` global — environment
+    // can only be read inside the shell (bash expands ${MIMO_DRIVER:-...} and
+    // $HOME at command build time). All secrets come from the credentials
+    // service; nothing is hardcoded.
     const BASE_URL = 'https://api.xiaomimimo.com/v1'
-    // Driver resolution: explicit env > user-local install (~/.local/lib).
-    const DRIVER = env.MIMO_DRIVER
-      || `${env.HOME || '/home'}/.local/lib/mimo-agent-tools/driver/mimo_driver.py`
-    const TMP_ROOT = env.MIMO_TMP || '/tmp'
+    // Driver path: explicit MIMO_DRIVER env else ~/.local/lib — expanded by the
+    // shell inside each command (sandbox has no process.env).
+    const DRIVER_SPEC = '${MIMO_DRIVER:-$HOME/.local/lib/mimo-agent-tools/driver/mimo_driver.py}'
+    const TMP_ROOT = '/tmp'
     // Credential name in the DSH credentials service (the web Models page
     // writes it); falls back to the same-named env var.
     const KEY_REF = 'XIAOMI_API_KEY'
@@ -72,7 +75,7 @@ return {
 
     // Resolve the API key from the DSH credentials service first, then the
     // environment. The credentials service is the canonical store (the web
-    // Models page writes keys there); env is a fallback for plain setups.
+    // Models page writes keys there).
     async function resolveKey() {
       if (credentials !== undefined) {
         try {
@@ -80,20 +83,19 @@ return {
           if (resolved !== undefined && typeof resolved.value === 'string' && resolved.value.length > 0) return resolved.value
         } catch {}
       }
-      const ambient = env[KEY_REF] || env.MIMO_API_KEY
-      if (typeof ambient === 'string' && ambient.length > 0) return ambient
-      throw new Error(`${KEY_REF} is not configured — store it in the DSH credentials (Models page) or export ${KEY_REF} in the environment`)
+      throw new Error(`${KEY_REF} is not configured — store it in the DSH credentials service (web Models page)`)
     }
 
     // Run the python driver: spec object -> response file. Only small OK/FAIL
     // crosses stdout; the raw API response is written to the response file.
+    // DRIVER_SPEC is intentionally unquoted so the shell expands ${MIMO_DRIVER:-...}.
     async function runDriver(spec, exec, timeoutMs = 120000) {
       const key = await resolveKey()
       const full = { url: BASE_URL + '/chat/completions', key, timeout: timeoutMs / 1000 | 0, ...spec }
       const specFile = `${TMP_ROOT}/mimo_spec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
       const respFile = `${TMP_ROOT}/mimo_resp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
       const specJson = JSON.stringify(full)
-      const cmd = `printf '%s' ${shq(btoa(specJson))} | base64 -d > ${shq(specFile)} && python3 ${shq(DRIVER)} ${shq(specFile)} ${shq(respFile)}`
+      const cmd = `printf '%s' ${shq(btoa(specJson))} | base64 -d > ${shq(specFile)} && python3 ${DRIVER_SPEC} ${shq(specFile)} ${shq(respFile)}`
       const r = await run(cmd, exec, { timeoutMs: timeoutMs + 20000 })
       const status = r.stdout.text.trim()
       let respText = null
