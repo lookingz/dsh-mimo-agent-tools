@@ -20,6 +20,15 @@ export function apply(ctx) {
   const KEY_REF = 'XIAOMI_API_KEY'
   const PRESET_VOICES = new Set(['mimo_default', '冰糖', '茉莉', '苏打', '白桦', 'Mia', 'Chloe', 'Milo', 'Dea'])
 
+  // UTF-8-safe base64: Node's b64() rejects non-Latin-1 (Chinese TTS text
+  // would throw "Invalid character"). Encode via TextEncoder + bytes first.
+  function b64(s) {
+    const bytes = new TextEncoder().encode(String(s))
+    let bin = ''
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i])
+    return btoa(bin)
+  }
+
   function shq(s) {
     return "'" + String(s).replace(/'/g, "'\\''") + "'"
   }
@@ -69,7 +78,7 @@ export function apply(ctx) {
     const specFile = `${TMP_ROOT}/mimo_spec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
     const respFile = `${TMP_ROOT}/mimo_resp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
     const specJson = JSON.stringify(full)
-    const cmd = `printf '%s' ${shq(btoa(specJson))} | base64 -d > ${shq(specFile)} && python3 ${DRIVER_SPEC} ${shq(specFile)} ${shq(respFile)}`
+    const cmd = `printf '%s' ${shq(b64(specJson))} | base64 -d > ${shq(specFile)} && python3 ${DRIVER_SPEC} ${shq(specFile)} ${shq(respFile)}`
     const r = await run(cmd, exec, { timeoutMs: timeoutMs + 20000 })
     const status = r.stdout.text.trim()
     let respText = null
@@ -202,7 +211,7 @@ export function apply(ctx) {
         })
         const specFile = `${TMP_ROOT}/mimo_spec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
         const respFile = `${TMP_ROOT}/mimo_resp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
-        const py = btoa([
+        const py = b64([
           'import json,sys,base64,urllib.request,urllib.error',
           'b=open(sys.argv[1],"rb").read()',
           'req=urllib.request.Request(sys.argv[2],data=b,headers={"api-key":sys.argv[3],"Content-Type":"application/json"})',
@@ -215,7 +224,7 @@ export function apply(ctx) {
           'except Exception as ex:',
           '  print("NET_ERR:"+str(ex)[:300])',
         ].join('\n'))
-        const cmd = `printf '%s' ${shq(btoa(body))} | base64 -d > ${shq(specFile)} && printf '%s' ${py} | base64 -d | python3 - ${shq(specFile)} ${shq(BASE_URL + '/chat/completions')} ${shq(key)} ${shq(respFile)}`
+        const cmd = `printf '%s' ${shq(b64(body))} | base64 -d > ${shq(specFile)} && printf '%s' ${py} | base64 -d | python3 - ${shq(specFile)} ${shq(BASE_URL + '/chat/completions')} ${shq(key)} ${shq(respFile)}`
         const r = await run(cmd, exec, { timeoutMs: 120000 })
         const status = r.stdout.text.trim()
         let respText = null
@@ -274,7 +283,7 @@ export function apply(ctx) {
           : { format: 'wav', optimize_text_preview: true }
         const body = JSON.stringify({ model, messages, audio })
         const tmp = `${TMP_ROOT}/mimo_tts_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
-        const py = btoa([
+        const py = b64([
           'import json,sys,base64,urllib.request,urllib.error',
           'b=open(sys.argv[1],"rb").read()',
           'req=urllib.request.Request(sys.argv[2],data=b,headers={"api-key":sys.argv[3],"Content-Type":"application/json"})',
@@ -287,14 +296,14 @@ export function apply(ctx) {
           'except Exception as ex:',
           '  print("NET_ERR:"+str(ex)[:300])',
         ].join('\n'))
-        const pyCmd = `python3 -c 'import base64,sys; open(sys.argv[1],"wb").write(base64.b64decode(sys.stdin.read()))' ${shq(tmp + '.json')} <<'DSH_EOF'\n${btoa(body)}\nDSH_EOF\nprintf '%s' ${py} | base64 -d | python3 - ${shq(tmp + '.json')} ${shq(BASE_URL + '/chat/completions')} ${shq(key)} ${shq(tmp + '.resp')}`
+        const pyCmd = `python3 -c 'import base64,sys; open(sys.argv[1],"wb").write(base64.b64decode(sys.stdin.read()))' ${shq(tmp + '.json')} <<'DSH_EOF'\n${b64(body)}\nDSH_EOF\nprintf '%s' ${py} | base64 -d | python3 - ${shq(tmp + '.json')} ${shq(BASE_URL + '/chat/completions')} ${shq(key)} ${shq(tmp + '.resp')}`
         const r = await run(pyCmd, exec, { timeoutMs: 200000 })
         const out = r.stdout.text.trim()
         if (!out.startsWith('OK')) {
           await run(`rm -f ${shq(tmp + '.json')} ${shq(tmp + '.resp')}`, exec, { timeoutMs: 5000 }).catch(() => {})
           return { ok: false, error: out.replace(/^(HTTP_ERR|NET_ERR):/, '') || 'TTS failed' }
         }
-        const dec = btoa([
+        const dec = b64([
           'import json,base64,sys',
           'd=json.load(open(sys.argv[1]))',
           'b=d["choices"][0]["message"]["audio"]["data"]',
