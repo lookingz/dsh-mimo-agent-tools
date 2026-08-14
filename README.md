@@ -57,11 +57,29 @@ large payloads. The driver therefore does ALL file reading, body assembly and
 HTTP POSTing inside one python3 process, using spec/response files on disk —
 nothing large ever crosses the shell.
 
-## Install (DSH)
+## Install (DSH bundle)
 
-This is a Cordis Host plugin. In a DSH session, define it with the Cordis
-toolset (or mount it in an agent preset composition), passing `src/index.js`
-as the host half, with `XIAOMI_API_KEY` exported in the DSH environment.
+Standard DSH bundle — install with the official plugin command (auto-inits
+the profile, pnpm-installs, and appends the bundle layer per
+`dsh.bundle.patch`):
+
+```bash
+# From a local checkout, or via git/npm:
+dsh plugin --profile web add /path/to/dsh-mimo-agent-tools
+# or: dsh plugin --profile web add github:you/dsh-mimo-agent-tools
+
+# Install the python driver to the default path (MIMO_DRIVER points at it):
+mkdir -p ~/.local/lib/mimo-agent-tools/driver
+cp driver/mimo_driver.py ~/.local/lib/mimo-agent-tools/driver/
+
+# Restart dsh web; the tools mount automatically.
+```
+
+Dependencies are declared as `peerDependencies` (ecosystem convention —
+`@deepseek-ai/dsh-tools` is already loaded in the DSH process, so nothing is
+duplicated). `dsh plugin add` installs the bundle into the profile's
+node_modules where peer deps resolve against the running harness.
+
 
 ## Notes on the MiMo API (from the official docs)
 
