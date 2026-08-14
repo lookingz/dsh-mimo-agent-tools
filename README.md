@@ -16,6 +16,14 @@ Backed by the OpenAI-compatible endpoint `https://api.xiaomimimo.com/v1`.
 | `mimo_video` | mimo-v2.5 | Video understanding from a public URL (mp4/webm/mov) |
 | `mimo_asr` | mimo-v2.5-asr | Speech-to-text with optional language hint |
 | `mimo_tts` | mimo-v2.5-tts / -voicedesign | Text-to-speech to a `.wav` file — preset voices or free-form voice design |
+| `mimo_voiceclone` | mimo-v2.5-tts-voiceclone | Voice cloning — reference clip + text → speech in that voice |
+
+## audio-tools skill
+
+The plugin registers an `audio-tools` skill that guides when to use the four
+audio tools (`mimo_asr`, `mimo_tts`, `mimo_voiceclone`, `mimo_audio`). The
+tools themselves are always registered — they are lightweight pure-API calls —
+so the skill only teaches usage, it does not gate the tools.
 
 ## Requirements
 

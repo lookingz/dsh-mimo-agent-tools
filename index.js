@@ -11,7 +11,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const name = 'dsh-mimo-agent-tools'
-export const inject = ['tools', 'shell', 'sandboxPolicy', 'credentials']
+export const inject = ['tools', 'shell', 'sandboxPolicy', 'credentials', 'skills']
 
 export function apply(ctx) {
   const BASE_URL = 'https://api.xiaomimimo.com/v1'
@@ -316,10 +316,127 @@ export function apply(ctx) {
         try { bytes = Number((await run(`wc -c < ${shq(outWsl)}`, exec, { timeoutMs: 5000 })).stdout.text.trim()) || 0 } catch {}
         return { ok: true, output: outWsl, bytes }
       }
+    },
+    {
+      name: 'mimo_voiceclone',
+      description: 'Voice cloning with the Xiaomi MiMo voice-clone model (mimo-v2.5-tts-voiceclone). Given a reference audio file (wav/mp3, local path or public URL) and target text, synthesizes speech in the reference speaker\'s voice. The reference audio is sent as a data URL; keep it short (a few seconds is enough).',
+      parameters: {
+        text: { type: 'string', required: true, description: 'Text to synthesize in the cloned voice' },
+        reference: { type: 'string', required: true, description: 'Reference audio path (local WSL/Windows path) or public URL — a short clip of the voice to clone' },
+        output: { type: 'string', description: 'Output .wav path on the Windows side (default C:\\Windows\\Temp\\mimo_voiceclone_<ts>.wav)' }
+      },
+      output: { schema: { type: 'json' }, render: renderJson },
+      async execute(args, exec) {
+        const key = await resolveKey()
+        const outPath = args.output || `C:\\Windows\\Temp\\mimo_voiceclone_${Date.now()}.wav`
+        const outWsl = '/mnt/c/Windows/Temp/' + outPath.split(/[\\/]/).pop()
+        const ref = String(args.reference)
+        const refWsl = wslPathOf(ref)
+        const isUrl = /^https?:\/\//i.test(ref)
+        const tmp = `${TMP_ROOT}/mimo_vc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+        // One python pass: read the reference audio (local file or URL), encode
+        // it as a data URL, build the full request body in memory, POST to MiMo,
+        // and write the raw response to a file. Everything stays on disk — the
+        // reference audio base64 (~154KB for a 115KB clip) must never cross the
+        // 64KB shell stdout cap that would truncate the data URL.
+        const py = b64([
+          'import sys,json,base64,urllib.request,urllib.error',
+          'src,text,api,url,out = sys.argv[1:6]',
+          'b=urllib.request.urlopen(src,timeout=60).read() if src.startswith(("http://","https://")) else open(src,"rb").read()',
+          'durl="data:audio/wav;base64,"+base64.b64encode(b).decode()',
+          'payload={"model":"mimo-v2.5-tts-voiceclone","messages":[{"role":"user","content":"Use this reference voice to speak the following text naturally."},{"role":"assistant","content":text}],"audio":{"format":"wav","voice":durl}}',
+          'req=urllib.request.Request(url,data=json.dumps(payload).encode(),headers={"api-key":api,"Content-Type":"application/json"})',
+          'try:',
+          '  r=urllib.request.urlopen(req,timeout=180)',
+          '  open(out,"wb").write(r.read())',
+          '  print("OK")',
+          'except urllib.error.HTTPError as e:',
+          '  open(out,"wb").write(e.read())',
+          '  print("HTTP_ERR")',
+          'except Exception as ex:',
+          '  open(out,"w").write("NET_ERR:"+str(ex)[:300])',
+          '  print("NET_ERR")',
+        ].join('\n'))
+        const pyCmd = `printf '%s' ${py} | base64 -d | python3 - ${shq(isUrl ? ref : refWsl)} ${shq(args.text)} ${shq(key)} ${shq(BASE_URL + '/chat/completions')} ${shq(tmp + '.resp')}`
+        const r = await run(pyCmd, exec, { timeoutMs: 220000 })
+        const status = r.stdout.text.trim()
+        await run(`rm -f ${shq(tmp + '.json')}`, exec, { timeoutMs: 5000 }).catch(() => {})
+        if (!status.startsWith('OK')) {
+          // On failure the response file may carry the HTTP error body; read it
+          // through python (not cat) so a large body cannot hit the stdout cap.
+          const errPy = b64([
+            'import sys',
+            'try: print(open(sys.argv[1],"rb").read().decode("utf-8","replace")[:400])',
+            'except Exception: print("")',
+          ].join('\n'))
+          const errRun = await run(`printf '%s' ${errPy} | base64 -d | python3 - ${shq(tmp + '.resp')}`, exec, { timeoutMs: 10000 })
+          const errText = (errRun.stdout.text || '').trim()
+          await run(`rm -f ${shq(tmp + '.resp')}`, exec, { timeoutMs: 5000 }).catch(() => {})
+          return { ok: false, error: errText.replace(/^(HTTP_ERR|NET_ERR):/, '') || status || 'voice clone failed' }
+        }
+        // Extract the base64 audio from the response JSON via python reading the
+        // file directly — the audio data can be ~150KB, far beyond the 64KB
+        // stdout cap, so `cat` would truncate it.
+        const extractPy = b64([
+          'import sys,json,base64',
+          'try:',
+          '  d=json.load(open(sys.argv[1],"rb"))',
+          '  b=d["choices"][0]["message"]["audio"]["data"]',
+          '  open(sys.argv[2],"wb").write(base64.b64decode(b))',
+          '  print("OK")',
+          'except Exception as ex:',
+          '  print("ERR:"+str(ex)[:300])',
+        ].join('\n'))
+        const extractRun = await run(`printf '%s' ${extractPy} | base64 -d | python3 - ${shq(tmp + '.resp')} ${shq(outWsl)}`, exec, { timeoutMs: 30000 })
+        await run(`rm -f ${shq(tmp + '.resp')}`, exec, { timeoutMs: 5000 }).catch(() => {})
+        if (!extractRun.stdout.text.trim().startsWith('OK')) {
+          return { ok: false, error: (extractRun.stdout.text.trim().replace(/^ERR:/, '') || 'failed to decode audio') }
+        }
+        let bytes = 0
+        try { bytes = Number((await run(`wc -c < ${shq(outWsl)}`, exec, { timeoutMs: 5000 })).stdout.text.trim()) || 0 } catch {}
+        return { ok: true, output: outWsl, bytes }
+      }
     }
   ]
 
   for (const tool of tools) {
     ctx.tools.register(defineTool(tool))
+  }
+
+  // audio-tools skill: guidance for the MiMo audio toolset (transcribe /
+  // speak / voiceclone / understand). The tools themselves are always
+  // registered — they are lightweight pure-API calls, unlike vision-toolkit's
+  // ten schemas — so this skill only teaches when to use which, and notes
+  // what each call sends to the MiMo API.
+  const audioSkill = {
+    name: 'audio-tools',
+    description: 'MiMo audio tools: mimo_asr (transcribe), mimo_tts (speak), mimo_voiceclone (clone a voice), mimo_audio (understand audio content).',
+    whenToUse: 'Use whenever a task involves audio: transcribing a recording, synthesizing speech, cloning a voice from a reference clip, or understanding the content of an audio file.',
+    content: [
+      '# audio-tools (MiMo edition)',
+      '',
+      'The Xiaomi MiMo audio tools turn a text-only agent into an audio-capable one. Use the native tools directly; the underlying API is Xiaomi MiMo, not OpenAI — the audio endpoints differ (no /audio/transcriptions or /audio/speech).',
+      '',
+      '## Tools',
+      '',
+      '- **mimo_asr** — transcribe an audio file (wav/mp3, local path or URL) to text with the MiMo ASR model. Optionally pass `language` (e.g. zh, en) for a hint.',
+      '- **mimo_tts** — synthesize text into a .wav file. `voice` is a preset ID (mimo_default/冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dea) or a free-form Chinese voice description (uses the voicedesign model). Output lands on the Windows side (default C:\\Windows\\Temp).',
+      '- **mimo_voiceclone** — clone a voice: give a short reference audio clip (local path or URL) plus target text; output is speech in the reference speaker\'s voice.',
+      '- **mimo_audio** — understand the content of an audio file (wav/mp3/flac/ogg/m4a): summarize, extract information, or answer questions about what is said or played.',
+      '',
+      '## Usage notes',
+      '',
+      '- Inputs accept local paths (WSL `/home/...`, `/mnt/c/...` or Windows `C:\\...`) or public URLs.',
+      '- TTS and voiceclone write .wav files to `C:\\Windows\\Temp` by default; pass `output` to choose another Windows-side path.',
+      '- For voice cloning, keep the reference clip short (a few seconds); the audio is sent to the MiMo API as a data URL.',
+      '- These tools send audio to the Xiaomi MiMo API; do not use them for sensitive audio you cannot upload.',
+    ].join('\n'),
+  }
+  try {
+    ctx.skills.register(audioSkill)
+  } catch (error) {
+    // A duplicate or invalid registration must not take the plugin down.
+    const logger = ctx.logger
+    logger?.warn?.('dsh-mimo-agent-tools: audio-tools skill registration failed: %s', error instanceof Error ? error.message : String(error))
   }
 }
