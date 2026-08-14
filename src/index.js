@@ -11,9 +11,10 @@
  *   mimo_asr      — speech-to-text (mimo-v2.5-asr)
  *   mimo_tts      — text-to-speech to a .wav file (mimo-v2.5-tts / -voicedesign)
  *
- * NO secrets are hardcoded. The API key is read from the XIAOMI_API_KEY
- * environment variable (or MIMO_API_KEY as a fallback) at apply time. The
- * python driver path is configurable via MIMO_DRIVER and defaults to the
+ * NO secrets are hardcoded. The API key is resolved from the DSH credentials
+ * service (key name XIAOMI_API_KEY — the web Models page writes it there),
+ * falling back to the XIAOMI_API_KEY / MIMO_API_KEY environment variables.
+ * The python driver path is configurable via MIMO_DRIVER and defaults to the
  * sibling `driver/mimo_driver.py` relative to this file.
  *
  * The multimodal payloads can be multi-megabyte (base64 of audio/images), so
@@ -22,16 +23,19 @@
  */
 return {
   name: 'mimo-agent-tools',
-  inject: ['shell', 'sandboxPolicy'],
+  inject: ['shell', 'sandboxPolicy', 'credentials'],
   apply(ctx) {
     const shell = ctx.get('shell')
     const sandboxPolicy = ctx.get('sandboxPolicy')
+    const credentials = ctx.get('credentials')
 
     const env = typeof process !== 'undefined' && process.env ? process.env : {}
-    const API_KEY = env.XIAOMI_API_KEY || env.MIMO_API_KEY || ''
     const BASE_URL = 'https://api.xiaomimimo.com/v1'
     const DRIVER = env.MIMO_DRIVER || '/usr/local/lib/mimo-agent-tools/driver/mimo_driver.py'
     const TMP_ROOT = env.MIMO_TMP || '/tmp'
+    // Credential name in the DSH credentials service (the web Models page
+    // writes it); falls back to the same-named env var.
+    const KEY_REF = 'XIAOMI_API_KEY'
 
     function shq(s) {
       return "'" + String(s).replace(/'/g, "'\\''") + "'"
@@ -64,15 +68,25 @@ return {
       return 'application/octet-stream'
     }
 
-    function requireKey() {
-      if (!API_KEY) throw new Error('MIMO_API_KEY/XIAOMI_API_KEY is not set in the environment')
-      return API_KEY
+    // Resolve the API key from the DSH credentials service first, then the
+    // environment. The credentials service is the canonical store (the web
+    // Models page writes keys there); env is a fallback for plain setups.
+    async function resolveKey() {
+      if (credentials !== undefined) {
+        try {
+          const resolved = await credentials.resolve(KEY_REF)
+          if (resolved !== undefined && typeof resolved.value === 'string' && resolved.value.length > 0) return resolved.value
+        } catch {}
+      }
+      const ambient = env[KEY_REF] || env.MIMO_API_KEY
+      if (typeof ambient === 'string' && ambient.length > 0) return ambient
+      throw new Error(`${KEY_REF} is not configured — store it in the DSH credentials (Models page) or export ${KEY_REF} in the environment`)
     }
 
     // Run the python driver: spec object -> response file. Only small OK/FAIL
     // crosses stdout; the raw API response is written to the response file.
     async function runDriver(spec, exec, timeoutMs = 120000) {
-      const key = requireKey()
+      const key = await resolveKey()
       const full = { url: BASE_URL + '/chat/completions', key, timeout: timeoutMs / 1000 | 0, ...spec }
       const specFile = `${TMP_ROOT}/mimo_spec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
       const respFile = `${TMP_ROOT}/mimo_resp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
@@ -114,7 +128,7 @@ return {
         },
         output: { schema: { type: 'json' }, render: renderJson },
         async execute(args, exec) {
-          const key = requireKey()
+          const key = await resolveKey()
           const maxKeyword = args.max_keyword !== undefined ? args.max_keyword : 3
           const limit = args.limit !== undefined ? args.limit : 5
           const body = {
@@ -204,7 +218,7 @@ return {
         },
         output: { schema: { type: 'json' }, render: renderText },
         async execute(args, exec) {
-          const key = requireKey()
+          const key = await resolveKey()
           const body = JSON.stringify({
             model: 'mimo-v2.5',
             messages: [{ role: 'user', content: [{ type: 'video_url', video_url: { url: args.url } }, { type: 'text', text: args.prompt || 'Please describe the video content.' }] }],
@@ -270,7 +284,7 @@ return {
         },
         output: { schema: { type: 'json' }, render: renderJson },
         async execute(args, exec) {
-          const key = requireKey()
+          const key = await resolveKey()
           const outPath = args.output || `C:\\Windows\\Temp\\mimo_tts_${Date.now()}.wav`
           const outWsl = '/mnt/c/Windows/Temp/' + outPath.split(/[\\/]/).pop()
           const voice = args.voice || 'mimo_default'

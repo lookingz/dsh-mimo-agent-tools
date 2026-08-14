@@ -26,12 +26,19 @@ Backed by the OpenAI-compatible endpoint `https://api.xiaomimimo.com/v1`.
 
 ## Configuration
 
-All secrets/options are read from the environment at plugin apply time —
-**nothing is hardcoded**:
+The API key is resolved at tool-call time from the **DSH credentials
+service** first (key name `XIAOMI_API_KEY` — the web Models page writes keys
+there), falling back to the environment. **Nothing is hardcoded**:
+
+| Source | Key | Priority |
+|---|---|---|
+| DSH credentials service (`~/.dsh/.credentials.yaml`, web Models page) | `XIAOMI_API_KEY` | 1 |
+| Environment | `XIAOMI_API_KEY` or `MIMO_API_KEY` | 2 |
+
+Other options (environment, read at apply time):
 
 | Env var | Purpose | Default |
 |---|---|---|
-| `XIAOMI_API_KEY` (or `MIMO_API_KEY`) | MiMo API key | *(required)* |
 | `MIMO_DRIVER` | path to `driver/mimo_driver.py` | `/usr/local/lib/mimo-agent-tools/driver/mimo_driver.py` |
 | `MIMO_TMP` | temp dir for spec/response files | `/tmp` |
 
