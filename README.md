@@ -39,14 +39,14 @@ Other options (environment, read at apply time):
 
 | Env var | Purpose | Default |
 |---|---|---|
-| `MIMO_DRIVER` | path to `driver/mimo_driver.py` | `/usr/local/lib/mimo-agent-tools/driver/mimo_driver.py` |
+| `MIMO_DRIVER` | path to `driver/mimo_driver.py` | `~/.local/lib/mimo-agent-tools/driver/mimo_driver.py` |
 | `MIMO_TMP` | temp dir for spec/response files | `/tmp` |
 
 Install the driver at the default path (or point `MIMO_DRIVER` at it):
 
 ```bash
-sudo mkdir -p /usr/local/lib/mimo-agent-tools/driver
-sudo cp driver/mimo_driver.py /usr/local/lib/mimo-agent-tools/driver/
+mkdir -p ~/.local/lib/mimo-agent-tools/driver
+cp driver/mimo_driver.py ~/.local/lib/mimo-agent-tools/driver/
 ```
 
 ## Why a python driver?

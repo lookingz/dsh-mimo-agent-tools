@@ -31,7 +31,9 @@ return {
 
     const env = typeof process !== 'undefined' && process.env ? process.env : {}
     const BASE_URL = 'https://api.xiaomimimo.com/v1'
-    const DRIVER = env.MIMO_DRIVER || '/usr/local/lib/mimo-agent-tools/driver/mimo_driver.py'
+    // Driver resolution: explicit env > user-local install (~/.local/lib).
+    const DRIVER = env.MIMO_DRIVER
+      || `${env.HOME || '/home'}/.local/lib/mimo-agent-tools/driver/mimo_driver.py`
     const TMP_ROOT = env.MIMO_TMP || '/tmp'
     // Credential name in the DSH credentials service (the web Models page
     // writes it); falls back to the same-named env var.
