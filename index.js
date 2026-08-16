@@ -379,12 +379,14 @@ export function apply(ctx) {
       parameters: {
         text: { type: 'string', required: true, description: 'Text to synthesize in the cloned voice' },
         reference: { type: 'string', required: true, description: 'Reference audio path (local WSL/Windows path) or public URL — a short clip of the voice to clone' },
-        output: { type: 'string', description: 'Output .wav path on the Windows side (default C:\\Windows\\Temp\\mimo_voiceclone_<ts>.wav)' }
+        output: { type: 'string', description: 'Output path on the Windows side (default C:\\Windows\\Temp\\mimo_voiceclone_<ts>.wav)' },
+        format: { type: 'string', description: 'Output audio format: wav (default) or mp3' }
       },
       output: { schema: { type: 'json' }, render: renderJson },
       async execute(args, exec) {
         const key = await resolveKey()
-        const outPath = args.output || `C:\\Windows\\Temp\\mimo_voiceclone_${Date.now()}.wav`
+        const fmt = args.format === 'mp3' ? 'mp3' : 'wav'
+        const outPath = args.output || `C:\\Windows\\Temp\\mimo_voiceclone_${Date.now()}.${fmt}`
         const outWsl = '/mnt/c/Windows/Temp/' + outPath.split(/[\\/]/).pop()
         const ref = String(args.reference)
         const refWsl = wslPathOf(ref)
@@ -400,10 +402,10 @@ export function apply(ctx) {
         // 64KB shell stdout cap that would truncate the data URL.
         const py = b64([
           'import sys,json,base64,urllib.request,urllib.error',
-          'src,text,mime,api,url,out = sys.argv[1:7]',
+          'src,text,mime,fmt,api,url,out = sys.argv[1:8]',
           'b=urllib.request.urlopen(src,timeout=60).read() if src.startswith(("http://","https://")) else open(src,"rb").read()',
           'durl="data:%s;base64,"%mime+base64.b64encode(b).decode()',
-          'payload={"model":"mimo-v2.5-tts-voiceclone","messages":[{"role":"user","content":"Use this reference voice to speak the following text naturally."},{"role":"assistant","content":text}],"audio":{"format":"wav","voice":durl}}',
+          'payload={"model":"mimo-v2.5-tts-voiceclone","messages":[{"role":"user","content":"Use this reference voice to speak the following text naturally."},{"role":"assistant","content":text}],"audio":{"format":fmt,"voice":durl}}',
           'req=urllib.request.Request(url,data=json.dumps(payload).encode(),headers={"api-key":api,"Content-Type":"application/json"})',
           'try:',
           '  r=urllib.request.urlopen(req,timeout=180)',
@@ -416,7 +418,7 @@ export function apply(ctx) {
           '  open(out,"w").write("NET_ERR:"+str(ex)[:300])',
           '  print("NET_ERR")',
         ].join('\n'))
-        const pyCmd = `printf '%s' ${py} | base64 -d | python3 - ${shq(isUrl ? ref : refWsl)} ${shq(args.text)} ${shq(refMime)} ${shq(key)} ${shq(BASE_URL + '/chat/completions')} ${shq(tmp + '.resp')}`
+        const pyCmd = `printf '%s' ${py} | base64 -d | python3 - ${shq(isUrl ? ref : refWsl)} ${shq(args.text)} ${shq(refMime)} ${shq(fmt)} ${shq(key)} ${shq(BASE_URL + '/chat/completions')} ${shq(tmp + '.resp')}`
         const r = await run(pyCmd, exec, { timeoutMs: 220000 })
         const status = r.stdout.text.trim()
         await run(`rm -f ${shq(tmp + '.json')}`, exec, { timeoutMs: 5000 }).catch(() => {})
@@ -480,13 +482,13 @@ export function apply(ctx) {
       '',
       '- **mimo_asr** — transcribe an audio file (wav/mp3, local path or URL) to text with the MiMo ASR model. Optionally pass `language` (e.g. zh, en) for a hint.',
       '- **mimo_tts** — synthesize text into a .wav/.mp3 file. `voice` is a preset ID (mimo_default/冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dean) or a free-form Chinese voice description (uses the voicedesign model). `style` adds a speaking tone; `format` picks wav (default) or mp3. Output lands on the Windows side (default C:\\Windows\\Temp).',
-      '- **mimo_voiceclone** — clone a voice: give a short reference audio clip (local path or URL) plus target text; output is speech in the reference speaker\'s voice.',
+      '- **mimo_voiceclone** — clone a voice: give a short reference audio clip (local path or URL) plus target text; output is speech in the reference speaker\'s voice. `format` picks wav (default) or mp3.',
       '- **mimo_audio** — understand the content of an audio file (wav/mp3/flac/ogg/m4a): summarize, extract information, or answer questions about what is said or played.',
       '',
       '## Usage notes',
       '',
       '- Inputs accept local paths (WSL `/home/...`, `/mnt/c/...` or Windows `C:\\...`) or public URLs.',
-      '- TTS and voiceclone write .wav files to `C:\\Windows\\Temp` by default; pass `output` to choose another Windows-side path.',
+      '- TTS and voiceclone write .wav files to `C:\\Windows\\Temp` by default (`.mp3` with `format: "mp3"`); pass `output` to choose another Windows-side path.',
       '- For voice cloning, keep the reference clip short (a few seconds); the audio is sent to the MiMo API as a data URL.',
       '- These tools send audio to the Xiaomi MiMo API; do not use them for sensitive audio you cannot upload.',
     ].join('\n'),

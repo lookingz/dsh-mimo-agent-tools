@@ -70,6 +70,13 @@ test('mimo_think and mimo_json exist with required prompt param', () => {
   assert.ok(byName.mimo_json.parameters.required.includes('prompt'))
 })
 
+test('mimo_voiceclone exposes format (wav/mp3)', () => {
+  const p = props(byName.mimo_voiceclone)
+  assert.equal(p.format.type, 'string')
+  assert.ok(p.format.description.includes('wav'))
+  assert.ok(p.format.description.includes('mp3'))
+})
+
 test('audio + asr descriptions claim URL support (now true)', () => {
   for (const t of ['mimo_audio', 'mimo_asr']) {
     assert.ok(byName[t].description.includes('public URL'), `${t} description should claim URL support`)

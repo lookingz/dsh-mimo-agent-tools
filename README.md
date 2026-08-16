@@ -18,7 +18,7 @@ Backed by the OpenAI-compatible endpoint `https://api.xiaomimimo.com/v1`.
 | `mimo_video` | mimo-v2.5 | Video understanding (mp4/webm/mov) — local file or public URL; optional `fps` / `media_resolution` |
 | `mimo_asr` | mimo-v2.5-asr | Speech-to-text with optional language hint — local file or public URL |
 | `mimo_tts` | mimo-v2.5-tts / -voicedesign | Text-to-speech to a `.wav`/`.mp3` file — preset voices or free-form voice design; optional `style` (speaking tone) and `format` (wav/mp3) |
-| `mimo_voiceclone` | mimo-v2.5-tts-voiceclone | Voice cloning — reference clip + text → speech in that voice |
+| `mimo_voiceclone` | mimo-v2.5-tts-voiceclone | Voice cloning — reference clip + text → speech in that voice; optional `format` (wav/mp3) |
 
 ## audio-tools skill
 
