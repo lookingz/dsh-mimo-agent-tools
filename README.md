@@ -10,12 +10,14 @@ Backed by the OpenAI-compatible endpoint `https://api.xiaomimimo.com/v1`.
 
 | Tool | Model | Purpose |
 |---|---|---|
-| `mimo_search` | mimo-v2.5-pro | Web search via the native `web_search` tool, returns answer + cited sources |
+| `mimo_search` | mimo-v2.5-pro | Web search via the native `web_search` tool, returns answer + cited sources (incl. site_name/logo_url); optional `force_search`, `user_location` |
+| `mimo_think` | mimo-v2.5-pro / mimo-v2.5 | Deep thinking — full reasoning chain (`reasoning_content`) + final answer |
+| `mimo_json` | mimo-v2.5-pro / mimo-v2.5 | Structured JSON output via `response_format: json_object` |
 | `mimo_vision` | mimo-v2.5 | Image understanding — local files (auto base64) or public URLs, multi-image |
-| `mimo_audio` | mimo-v2.5 | Audio understanding / transcription (wav/mp3/flac/ogg/m4a) |
-| `mimo_video` | mimo-v2.5 | Video understanding from a public URL (mp4/webm/mov) |
-| `mimo_asr` | mimo-v2.5-asr | Speech-to-text with optional language hint |
-| `mimo_tts` | mimo-v2.5-tts / -voicedesign | Text-to-speech to a `.wav` file — preset voices or free-form voice design |
+| `mimo_audio` | mimo-v2.5 | Audio understanding / transcription (wav/mp3/flac/ogg/m4a) — local file or public URL |
+| `mimo_video` | mimo-v2.5 | Video understanding (mp4/webm/mov) — local file or public URL; optional `fps` / `media_resolution` |
+| `mimo_asr` | mimo-v2.5-asr | Speech-to-text with optional language hint — local file or public URL |
+| `mimo_tts` | mimo-v2.5-tts / -voicedesign | Text-to-speech to a `.wav`/`.mp3` file — preset voices or free-form voice design; optional `style` (speaking tone) and `format` (wav/mp3) |
 | `mimo_voiceclone` | mimo-v2.5-tts-voiceclone | Voice cloning — reference clip + text → speech in that voice |
 
 ## audio-tools skill
@@ -92,12 +94,31 @@ node_modules where peer deps resolve against the running harness.
 ## Notes on the MiMo API (from the official docs)
 
 - TTS target text goes in the **assistant** message; the voice description
-  (voicedesign model) goes in the **user** message.
+  (voicedesign model) goes in the **user** message; a `style` instruction rides
+  the user message for preset voices and becomes an inline `(风格)` tag prefix
+  for voicedesign voices.
 - `mimo-v2.5-tts-voicedesign` does **not** accept an `audio.voice` field — it
   uses `optimize_text_preview` instead.
 - ASR (`mimo-v2.5-asr`) must **not** receive a `thinking` field.
+- `input_audio.data` / `video_url.url` accept either a public URL or a
+  `data:<mime>;base64,...` data URL (video base64 capped at 50MB per the docs).
 - Web search costs per keyword round (`max_keyword`, default 3) — see MiMo
-  pricing.
+  pricing. `force_search` (default true) trades freshness against cost;
+  `user_location` biases results, e.g.
+  `{"type":"approximate","country":"China","region":"Hubei","city":"Wuhan"}`.
+- Deep thinking (`mimo_think`) returns `reasoning_content` + `content`; in
+  multi-turn agent conversations with tool calls, `reasoning_content` from
+  earlier turns must be echoed back or the API returns 400.
+- Structured output (`mimo_json`) needs an explicit JSON shape description in
+  the prompt (fields, types, nesting); keep `max_completion_tokens` generous so
+  the JSON is not truncated mid-document.
+
+## Tests
+
+```bash
+python3 tests/test_driver.py   # driver request-body assembly (12 cases)
+node --test tests/tools.test.mjs  # tool registration surface (9 cases)
+```
 
 ## License
 

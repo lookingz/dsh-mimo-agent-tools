@@ -18,7 +18,7 @@ export function apply(ctx) {
   const DRIVER_SPEC = '${MIMO_DRIVER:-$HOME/.local/lib/mimo-agent-tools/driver/mimo_driver.py}'
   const TMP_ROOT = '/tmp'
   const KEY_REF = 'XIAOMI_API_KEY'
-  const PRESET_VOICES = new Set(['mimo_default', '冰糖', '茉莉', '苏打', '白桦', 'Mia', 'Chloe', 'Milo', 'Dea'])
+  const PRESET_VOICES = new Set(['mimo_default', '冰糖', '茉莉', '苏打', '白桦', 'Mia', 'Chloe', 'Milo', 'Dean'])
 
   // UTF-8-safe base64: Node's b64() rejects non-Latin-1 (Chinese TTS text
   // would throw "Invalid character"). Encode via TextEncoder + bytes first.
@@ -36,7 +36,8 @@ export function apply(ctx) {
     return /^([A-Za-z]):[\\/]/.test(path) ? '/mnt/' + path[0].toLowerCase() + path.slice(2).replace(/\\/g, '/') : String(path).replace(/\\/g, '/')
   }
   function mimeOf(path) {
-    const p = String(path).toLowerCase()
+    // Strip query/fragment so a URL like https://x/a.mp3?token=1 resolves.
+    const p = String(path).split(/[?#]/)[0].toLowerCase()
     const map = {
       '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
       '.webp': 'image/webp', '.bmp': 'image/bmp', '.wav': 'audio/wav', '.mp3': 'audio/mpeg',
@@ -85,7 +86,15 @@ export function apply(ctx) {
     try { respText = (await run(`cat ${shq(respFile)}`, exec, { timeoutMs: 10000 })).stdout.text } catch {}
     await run(`rm -f ${shq(specFile)} ${shq(respFile)}`, exec, { timeoutMs: 5000 }).catch(() => {})
     if (status === 'OK') {
-      try { return { ok: true, data: JSON.parse(respText.trim()) } } catch { return { ok: false, error: 'unparseable API response' } }
+      try {
+        const data = JSON.parse(respText.trim())
+        // Normalize API-level errors (d.error) once here so every tool's
+        // execute is just `if (!res.ok) return res`.
+        if (data?.error !== undefined) {
+          return { ok: false, error: typeof data.error === 'string' ? data.error : data.error.message ?? 'API error' }
+        }
+        return { ok: true, data }
+      } catch { return { ok: false, error: 'unparseable API response' } }
     }
     const t = (respText || '').trim()
     if (t.startsWith('HTTP_ERR:')) {
@@ -101,6 +110,14 @@ export function apply(ctx) {
 
   const renderJson = (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
   const renderText = (_a, v) => [{ type: 'text', text: typeof v.answer === 'string' ? v.answer : JSON.stringify(v, null, 2) }]
+  const renderThink = (_a, v) => {
+    const lines = []
+    if (typeof v.reasoning === 'string' && v.reasoning.length > 0) {
+      lines.push('<details><summary>Reasoning</summary>\n\n' + v.reasoning + '\n\n</details>')
+    }
+    lines.push(typeof v.answer === 'string' ? v.answer : JSON.stringify(v, null, 2))
+    return [{ type: 'text', text: lines.join('\n\n') }]
+  }
 
   const tools = [
     {
@@ -109,20 +126,24 @@ export function apply(ctx) {
       parameters: {
         query: { type: 'string', required: true, description: 'The search query' },
         max_keyword: { type: 'integer', description: 'Max keywords per search round (default 3, cost control)' },
-        limit: { type: 'integer', description: 'Max citations returned (default 5)' }
+        limit: { type: 'integer', description: 'Max citations returned (default 5)' },
+        force_search: { type: 'boolean', description: 'Force a fresh web search instead of allowing cached results (default true)' },
+        user_location: { type: 'object', additionalProperties: true, description: 'Approximate user location to bias results, e.g. {"type":"approximate","country":"China","region":"Hubei","city":"Wuhan"}' }
       },
       output: { schema: { type: 'json' }, render: renderJson },
       async execute(args, exec) {
         const key = await resolveKey()
         const maxKeyword = args.max_keyword !== undefined ? args.max_keyword : 3
         const limit = args.limit !== undefined ? args.limit : 5
+        const tool = { type: 'web_search', max_keyword: maxKeyword, force_search: args.force_search !== undefined ? args.force_search : true, limit }
+        if (args.user_location !== undefined && args.user_location !== null) tool.user_location = args.user_location
         const body = {
           model: 'mimo-v2.5-pro',
           messages: [{ role: 'user', content: `Perform a web search for the query: ${args.query}` }],
           max_completion_tokens: 1024,
           stream: false,
           thinking: { type: 'disabled' },
-          tools: [{ type: 'web_search', max_keyword: maxKeyword, force_search: true, limit }]
+          tools: [tool]
         }
         const json = JSON.stringify(body)
         const cmd = `curl -s --max-time 60 --location '${BASE_URL}/chat/completions' -H 'api-key: ${key}' -H 'Content-Type: application/json' -d ${shq(json)}`
@@ -145,10 +166,53 @@ export function apply(ctx) {
             url: ann.url,
             ...(typeof ann.title === 'string' && ann.title.length > 0 ? { title: ann.title } : {}),
             ...(typeof ann.summary === 'string' && ann.summary.length > 0 ? { snippet: ann.summary } : {}),
-            ...(typeof ann.publish_time === 'string' && ann.publish_time.length > 0 ? { publishedAt: ann.publish_time } : {})
+            ...(typeof ann.publish_time === 'string' && ann.publish_time.length > 0 ? { publishedAt: ann.publish_time } : {}),
+            ...(typeof ann.site_name === 'string' && ann.site_name.length > 0 ? { site_name: ann.site_name } : {}),
+            ...(typeof ann.logo_url === 'string' && ann.logo_url.length > 0 ? { logo_url: ann.logo_url } : {})
           })
         }
         return { ok: true, query: args.query, answer: content, sources, usage: data.usage ?? null }
+      }
+    },
+    {
+      name: 'mimo_think',
+      description: 'Deep reasoning with the Xiaomi MiMo deep-thinking mode (mimo-v2.5-pro). The model works through the problem step by step before answering; the response carries both the full reasoning chain (reasoning_content) and the final answer. Use for complex reasoning, code generation, math, multi-step analysis, and any task where a plain answer risks missing a step.',
+      parameters: {
+        prompt: { type: 'string', required: true, description: 'The question or problem to reason about' },
+        model: { type: 'string', description: 'Model (default mimo-v2.5-pro; mimo-v2.5 also supports deep thinking)' }
+      },
+      output: { schema: { type: 'json' }, render: renderThink },
+      async execute(args, exec) {
+        const res = await runDriver({ model: args.model || 'mimo-v2.5-pro', kind: 'think', prompt: args.prompt }, exec)
+        if (!res.ok) return { ok: false, error: res.error }
+        const d = res.data
+        const msg = d.choices?.[0]?.message
+        return {
+          ok: true,
+          reasoning: typeof msg?.reasoning_content === 'string' && msg.reasoning_content.length > 0 ? msg.reasoning_content : null,
+          answer: typeof msg?.content === 'string' && msg.content.length > 0 ? msg.content : null,
+          usage: d.usage ?? null
+        }
+      }
+    },
+    {
+      name: 'mimo_json',
+      description: 'Structured JSON output from the Xiaomi MiMo model (mimo-v2.5-pro / mimo-v2.5) via response_format json_object. Describe the exact JSON structure you need (fields, types, nesting, an example) in the prompt; the model returns only valid JSON. Use when you need machine-parseable structured data, not prose.',
+      parameters: {
+        prompt: { type: 'string', required: true, description: 'What to compute, plus the exact JSON structure required (fields, types, nesting; an example helps)' },
+        model: { type: 'string', description: 'Model (default mimo-v2.5-pro; mimo-v2.5 also supports structured output)' }
+      },
+      output: { schema: { type: 'json' }, render: renderJson },
+      async execute(args, exec) {
+        const res = await runDriver({ model: args.model || 'mimo-v2.5-pro', kind: 'json', prompt: args.prompt }, exec)
+        if (!res.ok) return { ok: false, error: res.error }
+        const d = res.data
+        const content = d.choices?.[0]?.message?.content ?? null
+        let data = null
+        if (typeof content === 'string' && content.length > 0) {
+          try { data = JSON.parse(content) } catch { data = content }
+        }
+        return { ok: true, data, usage: d.usage ?? null }
       }
     },
     {
@@ -169,7 +233,6 @@ export function apply(ctx) {
         const res = await runDriver({ model: 'mimo-v2.5', kind: 'vision', files: locals, urls, prompt: args.prompt }, exec)
         if (!res.ok) return { ok: false, error: res.error }
         const d = res.data
-        if (d.error !== undefined) return { ok: false, error: typeof d.error === 'string' ? d.error : d.error.message }
         return { ok: true, answer: d.choices?.[0]?.message?.content ?? null, usage: d.usage ?? null }
       }
     },
@@ -186,54 +249,36 @@ export function apply(ctx) {
         const res = await runDriver({
           model: 'mimo-v2.5', kind: 'audio',
           files: isUrl ? [] : [{ kind: 'audio', mime: mimeOf(args.audio), path: wslPathOf(args.audio) }],
+          urls: isUrl ? [args.audio] : [],
           prompt: args.prompt || 'Please transcribe the audio content.'
         }, exec)
         if (!res.ok) return { ok: false, error: res.error }
         const d = res.data
-        if (d.error !== undefined) return { ok: false, error: typeof d.error === 'string' ? d.error : d.error.message }
         return { ok: true, answer: d.choices?.[0]?.message?.content ?? null, usage: d.usage ?? null }
       }
     },
     {
       name: 'mimo_video',
-      description: 'Analyze video content with the Xiaomi MiMo model (mimo-v2.5). Accepts a public video URL (mp4/webm/mov).',
+      description: 'Analyze video content with the Xiaomi MiMo model (mimo-v2.5). Accepts a local video file path (Windows or WSL path; auto base64) or a public URL. Supports mp4/webm/mov.',
       parameters: {
-        url: { type: 'string', required: true, description: 'Public video URL (mp4/webm/mov)' },
-        prompt: { type: 'string', description: 'What to ask about the video (default: describe)' }
+        url: { type: 'string', required: true, description: 'Local video file path or public URL (mp4/webm/mov)' },
+        prompt: { type: 'string', description: 'What to ask about the video (default: describe)' },
+        fps: { type: 'integer', description: 'Frame sampling rate for analysis (e.g. 1, 2). Lower = cheaper/faster, higher = more detail. Optional.' },
+        media_resolution: { type: 'string', description: 'Resolution sent to the model (e.g. "default", "480p", "720p"). Optional.' }
       },
       output: { schema: { type: 'json' }, render: renderText },
       async execute(args, exec) {
-        const key = await resolveKey()
-        const body = JSON.stringify({
-          model: 'mimo-v2.5',
-          messages: [{ role: 'user', content: [{ type: 'video_url', video_url: { url: args.url } }, { type: 'text', text: args.prompt || 'Please describe the video content.' }] }],
-          stream: false, max_completion_tokens: 2048, thinking: { type: 'disabled' }
-        })
-        const specFile = `${TMP_ROOT}/mimo_spec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
-        const respFile = `${TMP_ROOT}/mimo_resp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
-        const py = b64([
-          'import json,sys,base64,urllib.request,urllib.error',
-          'b=open(sys.argv[1],"rb").read()',
-          'req=urllib.request.Request(sys.argv[2],data=b,headers={"api-key":sys.argv[3],"Content-Type":"application/json"})',
-          'try:',
-          '  r=urllib.request.urlopen(req,timeout=90)',
-          '  open(sys.argv[4],"wb").write(r.read())',
-          '  print("OK")',
-          'except urllib.error.HTTPError as e:',
-          '  print("HTTP_ERR:"+e.read().decode("utf-8","replace")[:500])',
-          'except Exception as ex:',
-          '  print("NET_ERR:"+str(ex)[:300])',
-        ].join('\n'))
-        const cmd = `printf '%s' ${shq(b64(body))} | base64 -d > ${shq(specFile)} && printf '%s' ${py} | base64 -d | python3 - ${shq(specFile)} ${shq(BASE_URL + '/chat/completions')} ${shq(key)} ${shq(respFile)}`
-        const r = await run(cmd, exec, { timeoutMs: 120000 })
-        const status = r.stdout.text.trim()
-        let respText = null
-        try { respText = (await run(`cat ${shq(respFile)}`, exec, { timeoutMs: 10000 })).stdout.text } catch {}
-        await run(`rm -f ${shq(specFile)} ${shq(respFile)}`, exec, { timeoutMs: 5000 }).catch(() => {})
-        if (!status.startsWith('OK')) return { ok: false, error: (respText || status).replace(/^(HTTP_ERR|NET_ERR):/, '').slice(0, 400) }
-        let d
-        try { d = JSON.parse(respText.trim()) } catch { return { ok: false, error: 'unparseable response' } }
-        if (d.error !== undefined) return { ok: false, error: typeof d.error === 'string' ? d.error : d.error.message }
+        const isUrl = /^https?:\/\//.test(args.url) || /^data:/.test(args.url)
+        const res = await runDriver({
+          model: 'mimo-v2.5', kind: 'video',
+          files: isUrl ? [] : [{ kind: 'video', mime: mimeOf(args.url), path: wslPathOf(args.url) }],
+          urls: isUrl ? [args.url] : [],
+          prompt: args.prompt || 'Please describe the video content.',
+          fps: args.fps,
+          media_resolution: args.media_resolution
+        }, exec)
+        if (!res.ok) return { ok: false, error: res.error }
+        const d = res.data
         return { ok: true, answer: d.choices?.[0]?.message?.content ?? null, usage: d.usage ?? null }
       }
     },
@@ -250,37 +295,48 @@ export function apply(ctx) {
         const res = await runDriver({
           model: 'mimo-v2.5-asr', kind: 'asr',
           files: isUrl ? [] : [{ kind: 'audio', mime: mimeOf(args.audio), path: wslPathOf(args.audio) }],
+          urls: isUrl ? [args.audio] : [],
           prompt: '',
           language: args.language
         }, exec)
         if (!res.ok) return { ok: false, error: res.error }
         const d = res.data
-        if (d.error !== undefined) return { ok: false, error: typeof d.error === 'string' ? d.error : d.error.message }
         return { ok: true, answer: d.choices?.[0]?.message?.content ?? null, usage: d.usage ?? null }
       }
     },
     {
       name: 'mimo_tts',
-      description: 'Text-to-speech with the Xiaomi MiMo TTS models. Writes the synthesized audio to a Windows-side .wav file (default C:\\Windows\\Temp\\mimo_tts_<ts>.wav). Voice: preset ID (mimo_default/冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo) or a free-form Chinese voice description (voicedesign).',
+      description: 'Text-to-speech with the Xiaomi MiMo TTS models. Writes the synthesized audio to a Windows-side file (default C:\\Windows\\Temp\\mimo_tts_<ts>.wav). Voice: preset ID (mimo_default/冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dean) or a free-form Chinese voice description (voicedesign).',
       parameters: {
         text: { type: 'string', required: true, description: 'Text to synthesize' },
         voice: { type: 'string', description: 'Preset voice ID or custom voice description (default mimo_default)' },
-        output: { type: 'string', description: 'Output .wav path on the Windows side' }
+        output: { type: 'string', description: 'Output path on the Windows side (default C:\\Windows\\Temp\\mimo_tts_<ts>.wav)' },
+        format: { type: 'string', description: 'Output audio format: wav (default) or mp3' },
+        style: { type: 'string', description: 'Optional speaking style (语气): a natural-language instruction such as 温柔/沉稳/轻快, or a full director-style paragraph (角色/场景/指导). With preset voices the style becomes the user instruction; with voicedesign voices it becomes an inline (风格) tag prefix.' }
       },
       output: { schema: { type: 'json' }, render: renderJson },
       async execute(args, exec) {
         const key = await resolveKey()
-        const outPath = args.output || `C:\\Windows\\Temp\\mimo_tts_${Date.now()}.wav`
+        const fmt = args.format === 'mp3' ? 'mp3' : 'wav'
+        const outPath = args.output || `C:\\Windows\\Temp\\mimo_tts_${Date.now()}.${fmt}`
         const outWsl = '/mnt/c/Windows/Temp/' + outPath.split(/[\\/]/).pop()
         const voice = args.voice || 'mimo_default'
         const isPreset = PRESET_VOICES.has(voice)
         const model = isPreset ? 'mimo-v2.5-tts' : 'mimo-v2.5-tts-voicedesign'
+        const style = typeof args.style === 'string' ? args.style.trim() : ''
+        let userContent = isPreset ? (style || 'Speak the following text naturally.') : voice
+        let text = args.text
+        if (!isPreset && style) {
+          // voicedesign owns the user message (the voice description), so the
+          // style rides as an inline (风格) tag prefix — matches voice-mimo.
+          text = `(${style})${text}`
+        }
         const messages = []
-        messages.push({ role: 'user', content: isPreset ? 'Speak the following text naturally.' : voice })
-        messages.push({ role: 'assistant', content: args.text })
+        messages.push({ role: 'user', content: userContent })
+        messages.push({ role: 'assistant', content: text })
         const audio = isPreset
-          ? { format: 'wav', voice }
-          : { format: 'wav', optimize_text_preview: true }
+          ? { format: fmt, voice }
+          : { format: fmt, optimize_text_preview: true }
         const body = JSON.stringify({ model, messages, audio })
         const tmp = `${TMP_ROOT}/mimo_tts_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
         const py = b64([
@@ -333,6 +389,9 @@ export function apply(ctx) {
         const ref = String(args.reference)
         const refWsl = wslPathOf(ref)
         const isUrl = /^https?:\/\//i.test(ref)
+        // Real MIME from the reference file extension — hardcoding audio/wav
+        // misreports an mp3 reference to the API (which then rejects it).
+        const refMime = mimeOf(ref)
         const tmp = `${TMP_ROOT}/mimo_vc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
         // One python pass: read the reference audio (local file or URL), encode
         // it as a data URL, build the full request body in memory, POST to MiMo,
@@ -341,9 +400,9 @@ export function apply(ctx) {
         // 64KB shell stdout cap that would truncate the data URL.
         const py = b64([
           'import sys,json,base64,urllib.request,urllib.error',
-          'src,text,api,url,out = sys.argv[1:6]',
+          'src,text,mime,api,url,out = sys.argv[1:7]',
           'b=urllib.request.urlopen(src,timeout=60).read() if src.startswith(("http://","https://")) else open(src,"rb").read()',
-          'durl="data:audio/wav;base64,"+base64.b64encode(b).decode()',
+          'durl="data:%s;base64,"%mime+base64.b64encode(b).decode()',
           'payload={"model":"mimo-v2.5-tts-voiceclone","messages":[{"role":"user","content":"Use this reference voice to speak the following text naturally."},{"role":"assistant","content":text}],"audio":{"format":"wav","voice":durl}}',
           'req=urllib.request.Request(url,data=json.dumps(payload).encode(),headers={"api-key":api,"Content-Type":"application/json"})',
           'try:',
@@ -357,7 +416,7 @@ export function apply(ctx) {
           '  open(out,"w").write("NET_ERR:"+str(ex)[:300])',
           '  print("NET_ERR")',
         ].join('\n'))
-        const pyCmd = `printf '%s' ${py} | base64 -d | python3 - ${shq(isUrl ? ref : refWsl)} ${shq(args.text)} ${shq(key)} ${shq(BASE_URL + '/chat/completions')} ${shq(tmp + '.resp')}`
+        const pyCmd = `printf '%s' ${py} | base64 -d | python3 - ${shq(isUrl ? ref : refWsl)} ${shq(args.text)} ${shq(refMime)} ${shq(key)} ${shq(BASE_URL + '/chat/completions')} ${shq(tmp + '.resp')}`
         const r = await run(pyCmd, exec, { timeoutMs: 220000 })
         const status = r.stdout.text.trim()
         await run(`rm -f ${shq(tmp + '.json')}`, exec, { timeoutMs: 5000 }).catch(() => {})
@@ -420,7 +479,7 @@ export function apply(ctx) {
       '## Tools',
       '',
       '- **mimo_asr** — transcribe an audio file (wav/mp3, local path or URL) to text with the MiMo ASR model. Optionally pass `language` (e.g. zh, en) for a hint.',
-      '- **mimo_tts** — synthesize text into a .wav file. `voice` is a preset ID (mimo_default/冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dea) or a free-form Chinese voice description (uses the voicedesign model). Output lands on the Windows side (default C:\\Windows\\Temp).',
+      '- **mimo_tts** — synthesize text into a .wav/.mp3 file. `voice` is a preset ID (mimo_default/冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dean) or a free-form Chinese voice description (uses the voicedesign model). `style` adds a speaking tone; `format` picks wav (default) or mp3. Output lands on the Windows side (default C:\\Windows\\Temp).',
       '- **mimo_voiceclone** — clone a voice: give a short reference audio clip (local path or URL) plus target text; output is speech in the reference speaker\'s voice.',
       '- **mimo_audio** — understand the content of an audio file (wav/mp3/flac/ogg/m4a): summarize, extract information, or answer questions about what is said or played.',
       '',
