@@ -1,6 +1,6 @@
 {
   "name": "dsh-mimo-agent-tools",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Xiaomi MiMo search + multimodal tools for DSH agents: mimo_search/vision/audio/video/asr/tts.",
   "type": "module",
   "main": "index.js",

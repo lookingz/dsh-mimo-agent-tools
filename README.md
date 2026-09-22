@@ -4,7 +4,8 @@ DSH (DeepSeek Harness) Cordis plugin that turns the **Xiaomi MiMo API** into
 model tools for an agent: web search, image/audio/video understanding,
 speech-to-text, and text-to-speech.
 
-Backed by the OpenAI-compatible endpoint `https://api.xiaomimimo.com/v1`.
+Backed by the OpenAI-compatible endpoint `https://api.xiaomimimo.com/v1`
+(configurable — see `XIAOMI_BASE_URL` below).
 
 ## Tools
 
@@ -36,14 +37,19 @@ so the skill only teaches usage, it does not gate the tools.
 
 ## Configuration
 
-The API key is resolved at tool-call time from the **DSH credentials
-service** first (key name `XIAOMI_API_KEY` — the web Models page writes keys
-there), falling back to the environment. **Nothing is hardcoded**:
+Both the API key and the base URL are resolved at tool-call time from the
+**DSH credentials service** (`~/.dsh/.credentials.yaml`, written by the web
+Models page). **Nothing is hardcoded**:
 
-| Source | Key | Priority |
-|---|---|---|
-| DSH credentials service (`~/.dsh/.credentials.yaml`, web Models page) | `XIAOMI_API_KEY` | 1 |
-| Environment | `XIAOMI_API_KEY` or `MIMO_API_KEY` | 2 |
+| Key | Required | Default | Purpose |
+|---|---|---|---|
+| `XIAOMI_API_KEY` | yes | — | MiMo API key |
+| `XIAOMI_BASE_URL` | no | `https://api.xiaomimimo.com/v1` | API base URL. Set this to your plan's endpoint — e.g. Token Plan keys (`tp-*`) only work on `https://token-plan-cn.xiaomimimo.com/v1`; using the default endpoint returns `401 Invalid API Key`. |
+
+Platform support: macOS, Linux, Windows/WSL. TTS/voiceclone output files
+default to the system temp dir (`/tmp` on macOS/Linux, `C:\Windows\Temp` on
+Windows); pass `output` to choose another path. POSIX paths are used as-is;
+Windows paths like `C:\...` are translated for WSL.
 
 Other options (environment, read at apply time):
 

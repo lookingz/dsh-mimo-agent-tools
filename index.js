@@ -14,7 +14,8 @@ export const name = 'dsh-mimo-agent-tools'
 export const inject = ['tools', 'shell', 'sandboxPolicy', 'credentials', 'skills']
 
 export function apply(ctx) {
-  const BASE_URL = 'https://api.xiaomimimo.com/v1'
+  const DEFAULT_BASE_URL = 'https://api.xiaomimimo.com/v1'
+  const BASE_URL_REF = 'XIAOMI_BASE_URL'
   const DRIVER_SPEC = '${MIMO_DRIVER:-$HOME/.local/lib/mimo-agent-tools/driver/mimo_driver.py}'
   const TMP_ROOT = '/tmp'
   const KEY_REF = 'XIAOMI_API_KEY'
@@ -73,9 +74,25 @@ export function apply(ctx) {
     throw new Error(`${KEY_REF} is not configured — store it in the DSH credentials service (web Models page)`)
   }
 
+  // Base URL is configurable because Token Plan keys (tp-*) only work on the
+  // token-plan endpoint, not the default api.xiaomimimo.com endpoint.
+  async function resolveBaseUrl() {
+    const credentials = ctx.get('credentials')
+    if (credentials !== undefined) {
+      try {
+        const resolved = await credentials.resolve(BASE_URL_REF)
+        if (resolved !== undefined && typeof resolved.value === 'string' && /^https?:\/\//.test(resolved.value)) {
+          return resolved.value.replace(/\/+$/, '')
+        }
+      } catch {}
+    }
+    return DEFAULT_BASE_URL
+  }
+
   async function runDriver(spec, exec, timeoutMs = 120000) {
     const key = await resolveKey()
-    const full = { url: BASE_URL + '/chat/completions', key, timeout: timeoutMs / 1000 | 0, ...spec }
+    const baseUrl = await resolveBaseUrl()
+    const full = { url: baseUrl + '/chat/completions', key, timeout: timeoutMs / 1000 | 0, ...spec }
     const specFile = `${TMP_ROOT}/mimo_spec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
     const respFile = `${TMP_ROOT}/mimo_resp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
     const specJson = JSON.stringify(full)
@@ -133,6 +150,7 @@ export function apply(ctx) {
       output: { schema: { type: 'json' }, render: renderJson },
       async execute(args, exec) {
         const key = await resolveKey()
+        const baseUrl = await resolveBaseUrl()
         const maxKeyword = args.max_keyword !== undefined ? args.max_keyword : 3
         const limit = args.limit !== undefined ? args.limit : 5
         const tool = { type: 'web_search', max_keyword: maxKeyword, force_search: args.force_search !== undefined ? args.force_search : true, limit }
@@ -146,7 +164,7 @@ export function apply(ctx) {
           tools: [tool]
         }
         const json = JSON.stringify(body)
-        const cmd = `curl -s --max-time 60 --location '${BASE_URL}/chat/completions' -H 'api-key: ${key}' -H 'Content-Type: application/json' -d ${shq(json)}`
+        const cmd = `curl -s --max-time 60 --location '${baseUrl}/chat/completions' -H 'api-key: ${key}' -H 'Content-Type: application/json' -d ${shq(json)}`
         const r = await run(cmd, exec, { timeoutMs: 70000 })
         let data = null
         let parseError = null
@@ -306,20 +324,22 @@ export function apply(ctx) {
     },
     {
       name: 'mimo_tts',
-      description: 'Text-to-speech with the Xiaomi MiMo TTS models. Writes the synthesized audio to a Windows-side file (default C:\\Windows\\Temp\\mimo_tts_<ts>.wav). Voice: preset ID (mimo_default/冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dean) or a free-form Chinese voice description (voicedesign).',
+      description: 'Text-to-speech with the Xiaomi MiMo TTS models. Writes the synthesized audio to a file (default: system temp dir). Voice: preset ID (mimo_default/冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dean) or a free-form Chinese voice description (voicedesign).',
       parameters: {
         text: { type: 'string', required: true, description: 'Text to synthesize' },
         voice: { type: 'string', description: 'Preset voice ID or custom voice description (default mimo_default)' },
-        output: { type: 'string', description: 'Output path on the Windows side (default C:\\Windows\\Temp\\mimo_tts_<ts>.wav)' },
+        output: { type: 'string', description: 'Output file path (default: system temp dir). POSIX paths are used as-is; Windows paths are translated for WSL.' },
         format: { type: 'string', description: 'Output audio format: wav (default) or mp3' },
         style: { type: 'string', description: 'Optional speaking style (语气): a natural-language instruction such as 温柔/沉稳/轻快, or a full director-style paragraph (角色/场景/指导). With preset voices the style becomes the user instruction; with voicedesign voices it becomes an inline (风格) tag prefix.' }
       },
       output: { schema: { type: 'json' }, render: renderJson },
       async execute(args, exec) {
         const key = await resolveKey()
+        const baseUrl = await resolveBaseUrl()
         const fmt = args.format === 'mp3' ? 'mp3' : 'wav'
-        const outPath = args.output || `C:\\Windows\\Temp\\mimo_tts_${Date.now()}.${fmt}`
-        const outWsl = '/mnt/c/Windows/Temp/' + outPath.split(/[\\/]/).pop()
+        const uname = (await run('uname -s 2>/dev/null || echo Windows', exec, { timeoutMs: 5000 })).stdout.text.trim()
+        const outPath = args.output || (uname === 'Windows' ? `C:\\Windows\\Temp\\mimo_tts_${Date.now()}.${fmt}` : `${TMP_ROOT}/mimo_tts_${Date.now()}.${fmt}`)
+        const outWsl = /^[A-Za-z]:[\\/]/.test(outPath) ? wslPathOf(outPath) : outPath
         const voice = args.voice || 'mimo_default'
         const isPreset = PRESET_VOICES.has(voice)
         const model = isPreset ? 'mimo-v2.5-tts' : 'mimo-v2.5-tts-voicedesign'
@@ -352,7 +372,7 @@ export function apply(ctx) {
           'except Exception as ex:',
           '  print("NET_ERR:"+str(ex)[:300])',
         ].join('\n'))
-        const pyCmd = `python3 -c 'import base64,sys; open(sys.argv[1],"wb").write(base64.b64decode(sys.stdin.read()))' ${shq(tmp + '.json')} <<'DSH_EOF'\n${b64(body)}\nDSH_EOF\nprintf '%s' ${py} | base64 -d | python3 - ${shq(tmp + '.json')} ${shq(BASE_URL + '/chat/completions')} ${shq(key)} ${shq(tmp + '.resp')}`
+        const pyCmd = `python3 -c 'import base64,sys; open(sys.argv[1],"wb").write(base64.b64decode(sys.stdin.read()))' ${shq(tmp + '.json')} <<'DSH_EOF'\n${b64(body)}\nDSH_EOF\nprintf '%s' ${py} | base64 -d | python3 - ${shq(tmp + '.json')} ${shq(baseUrl + '/chat/completions')} ${shq(key)} ${shq(tmp + '.resp')}`
         const r = await run(pyCmd, exec, { timeoutMs: 200000 })
         const out = r.stdout.text.trim()
         if (!out.startsWith('OK')) {
@@ -379,15 +399,17 @@ export function apply(ctx) {
       parameters: {
         text: { type: 'string', required: true, description: 'Text to synthesize in the cloned voice' },
         reference: { type: 'string', required: true, description: 'Reference audio path (local WSL/Windows path) or public URL — a short clip of the voice to clone' },
-        output: { type: 'string', description: 'Output path on the Windows side (default C:\\Windows\\Temp\\mimo_voiceclone_<ts>.wav)' },
+        output: { type: 'string', description: 'Output file path (default: system temp dir). POSIX paths are used as-is; Windows paths are translated for WSL.' },
         format: { type: 'string', description: 'Output audio format: wav (default) or mp3' }
       },
       output: { schema: { type: 'json' }, render: renderJson },
       async execute(args, exec) {
         const key = await resolveKey()
+        const baseUrl = await resolveBaseUrl()
         const fmt = args.format === 'mp3' ? 'mp3' : 'wav'
-        const outPath = args.output || `C:\\Windows\\Temp\\mimo_voiceclone_${Date.now()}.${fmt}`
-        const outWsl = '/mnt/c/Windows/Temp/' + outPath.split(/[\\/]/).pop()
+        const uname = (await run('uname -s 2>/dev/null || echo Windows', exec, { timeoutMs: 5000 })).stdout.text.trim()
+        const outPath = args.output || (uname === 'Windows' ? `C:\\Windows\\Temp\\mimo_voiceclone_${Date.now()}.${fmt}` : `${TMP_ROOT}/mimo_voiceclone_${Date.now()}.${fmt}`)
+        const outWsl = /^[A-Za-z]:[\\/]/.test(outPath) ? wslPathOf(outPath) : outPath
         const ref = String(args.reference)
         const refWsl = wslPathOf(ref)
         const isUrl = /^https?:\/\//i.test(ref)
@@ -418,7 +440,7 @@ export function apply(ctx) {
           '  open(out,"w").write("NET_ERR:"+str(ex)[:300])',
           '  print("NET_ERR")',
         ].join('\n'))
-        const pyCmd = `printf '%s' ${py} | base64 -d | python3 - ${shq(isUrl ? ref : refWsl)} ${shq(args.text)} ${shq(refMime)} ${shq(fmt)} ${shq(key)} ${shq(BASE_URL + '/chat/completions')} ${shq(tmp + '.resp')}`
+        const pyCmd = `printf '%s' ${py} | base64 -d | python3 - ${shq(isUrl ? ref : refWsl)} ${shq(args.text)} ${shq(refMime)} ${shq(fmt)} ${shq(key)} ${shq(baseUrl + '/chat/completions')} ${shq(tmp + '.resp')}`
         const r = await run(pyCmd, exec, { timeoutMs: 220000 })
         const status = r.stdout.text.trim()
         await run(`rm -f ${shq(tmp + '.json')}`, exec, { timeoutMs: 5000 }).catch(() => {})
