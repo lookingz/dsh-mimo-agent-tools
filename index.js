@@ -15,7 +15,14 @@ import { fileURLToPath } from 'node:url'
 export const name = 'dsh-mimo-agent-tools'
 export const inject = ['tools', 'shell', 'sandboxPolicy', 'credentials', 'skills']
 
-export function apply(ctx) {
+/**
+ * Shared MiMo runtime: shell pipeline (Git Bash routing, python driver spec
+ * files), credential resolution, and the runDriver call every MiMo API
+ * request goes through. Extracted to module scope so sibling plugin entries
+ * (speech.js — the official speechToText provider) reuse the exact same
+ * pipeline as the agent tools instead of duplicating it.
+ */
+export function createRuntime(ctx) {
   const BASE_URL = 'https://api.xiaomimimo.com/v1'
   // Windows port (2026-09-29): run shell work through a POSIX bash — MSYS2 or Git for
   // Windows — which supplies the printf/base64/curl/wc/rm/mktemp toolchain and a real /tmp
@@ -138,6 +145,12 @@ export function apply(ctx) {
     if (t.startsWith('NET_ERR:')) return { ok: false, error: t.slice(8) }
     return { ok: false, error: (t || 'no response').slice(0, 400) }
   }
+
+  return { BASE_URL, TMP_ROOT, KEY_REF, PRESET_VOICES, b64, shq, wslPathOf, msysPathOf, mimeOf, run, resolveKey, runDriver }
+}
+
+export function apply(ctx) {
+  const { PRESET_VOICES, shq, wslPathOf, mimeOf, run, resolveKey, runDriver } = createRuntime(ctx)
 
   const renderJson = (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
   const renderText = (_a, v) => [{ type: 'text', text: typeof v.answer === 'string' ? v.answer : JSON.stringify(v, null, 2) }]

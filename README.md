@@ -116,9 +116,29 @@ node_modules where peer deps resolve against the running harness.
 ## Tests
 
 ```bash
-python3 tests/test_driver.py   # driver request-body assembly (12 cases)
-node --test tests/tools.test.mjs  # tool registration surface (9 cases)
+python3 tests/test_driver.py      # driver request-body assembly (14 cases)
+node --test tests/tools.test.mjs  # tool registration surface (10 cases)
+node --test tests/speech.test.mjs # speechToText provider surface (4 cases)
 ```
+
+## Official voice input (speechToText provider)
+
+`speech.js` is a separate plugin entry that plugs Xiaomi MiMo ASR
+(`mimo-v2.5-asr`) into dsh's **official** voice-input stack as a cloud
+provider: the built-in 🎤 capture → RPC → provider-registry pipeline stays
+untouched; recordings are transcribed by MiMo and the transcript lands in
+the input box.
+
+- The entry stays dormant (`inject: ['speechToText', ...]`) on deployments
+  without `@deepseek-ai/dsh-experimental-voice-input-bundle` — the agent
+  tools are unaffected either way.
+- The bundle patch overrides the `speech-to-text` row's `defaultProvider`
+  to `mimo`. **Bundle order matters**: this package must compose AFTER the
+  voice-input bundle in `dsh.profile.bundles` (the override only lands on an
+  already-inserted row). SenseVoice stays registered and can be re-selected
+  in the official voice settings.
+- Credentials: the same `XIAOMI_API_KEY` entry in the DSH credentials
+  service the tools use.
 
 ## License
 

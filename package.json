@@ -4,8 +4,14 @@
   "description": "Xiaomi MiMo search + multimodal tools for DSH agents: mimo_search/vision/audio/video/asr/tts.",
   "type": "module",
   "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./speech": "./speech.js",
+    "./package.json": "./package.json"
+  },
   "files": [
     "index.js",
+    "speech.js",
     "cordis.patch.yml",
     "driver/mimo_driver.py",
     "README.md",
