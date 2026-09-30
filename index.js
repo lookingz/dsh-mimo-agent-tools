@@ -9,13 +9,33 @@
 // sandbox has no process.env. Large base64 payloads are handled entirely
 // inside the python driver to dodge the 64KB shell stdout cap.
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { existsSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 
 export const name = 'dsh-mimo-agent-tools'
 export const inject = ['tools', 'shell', 'sandboxPolicy', 'credentials', 'skills']
 
 export function apply(ctx) {
   const BASE_URL = 'https://api.xiaomimimo.com/v1'
-  const DRIVER_SPEC = '${MIMO_DRIVER:-$HOME/.local/lib/mimo-agent-tools/driver/mimo_driver.py}'
+  // Windows port (2026-09-29): run shell work through a POSIX bash — MSYS2 or Git for
+  // Windows — which supplies the printf/base64/curl/wc/rm/mktemp toolchain and a real /tmp
+  // this plugin was written against, and whose msys path mangling converts /c/... arguments
+  // for the native python.exe. Their `python` is the user's Python; `python3` is the
+  // WindowsApps stub, so PY is used everywhere below. MIMO_BASH overrides the discovery.
+  const ENV = typeof process === 'undefined' ? {} : (process.env ?? {})
+  const GIT_BASH = [
+    ENV.MIMO_BASH,
+    'C:/msys64/usr/bin/bash.exe',
+    'C:/Program Files/Git/bin/bash.exe',
+    'C:/Program Files (x86)/Git/bin/bash.exe',
+    ENV.LOCALAPPDATA === undefined ? undefined : `${ENV.LOCALAPPDATA}/Programs/Git/bin/bash.exe`,
+  ].find((candidate) => candidate !== undefined && candidate !== '' && existsSync(candidate))
+  const PY = 'python'
+  const msysPathOf = (p) => {
+    const s = String(p).replace(/\\/g, '/')
+    return /^[A-Za-z]:\//.test(s) ? '/' + s[0].toLowerCase() + s.slice(2) : s
+  }
+  const DRIVER_SPEC = '${MIMO_DRIVER:-' + msysPathOf(fileURLToPath(new URL('./driver/mimo_driver.py', import.meta.url))) + '}'
   const TMP_ROOT = '/tmp'
   const KEY_REF = 'XIAOMI_API_KEY'
   const PRESET_VOICES = new Set(['mimo_default', '冰糖', '茉莉', '苏打', '白桦', 'Mia', 'Chloe', 'Milo', 'Dean'])
@@ -33,7 +53,9 @@ export function apply(ctx) {
     return "'" + String(s).replace(/'/g, "'\\''") + "'"
   }
   function wslPathOf(path) {
-    return /^([A-Za-z]):[\\/]/.test(path) ? '/mnt/' + path[0].toLowerCase() + path.slice(2).replace(/\\/g, '/') : String(path).replace(/\\/g, '/')
+    // Git Bash form (C:\\Work\\x -> /c/Work/x): bash builtins accept it directly and
+    // MSYS converts it back for native executables such as python.exe.
+    return /^([A-Za-z]):[\\/]/.test(path) ? '/' + path[0].toLowerCase() + path.slice(2).replace(/\\/g, '/') : String(path).replace(/\\/g, '/')
   }
   function mimeOf(path) {
     // Strip query/fragment so a URL like https://x/a.mp3?token=1 resolves.
@@ -53,13 +75,22 @@ export function apply(ctx) {
       exec !== undefined && exec.agent !== undefined ? { session: exec.agent.session } : {}
     )
     const shell = ctx.get('shell')
+    // Route through Git Bash so POSIX pipelines, /tmp and ${VAR:-default} resolve on Windows.
+    const psq = (s) => "'" + String(s).replace(/'/g, "''") + "'"
+    // The seam may already BE a POSIX bash (the profile's msys-bash executor); wrap only
+    // when the host shell is not POSIX (the PowerShell implementation).
+    const shellName = String(shell?.constructor?.name ?? '')
+    const posixShell = /bash|(^|\b)sh\b/i.test(shellName)
+    const effective = GIT_BASH === undefined || posixShell ? command : `& ${psq(GIT_BASH)} -lc ${psq(command)}`
     const request = {
-      command,
+      command: effective,
       ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
       ...(policy !== undefined ? { sandboxPolicy: policy } : {}),
       ...(exec !== undefined && exec.signal !== undefined ? { signal: exec.signal } : {})
     }
-    return shell.run(shell.resolve(request))
+    // DSH 0.2.0: shell.run(spec) → shell.execute(spec) + execution.result()
+    const execution = await shell.execute(shell.resolve(request))
+    return await execution.result()
   }
 
   async function resolveKey() {
@@ -79,7 +110,7 @@ export function apply(ctx) {
     const specFile = `${TMP_ROOT}/mimo_spec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
     const respFile = `${TMP_ROOT}/mimo_resp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
     const specJson = JSON.stringify(full)
-    const cmd = `printf '%s' ${shq(b64(specJson))} | base64 -d > ${shq(specFile)} && python3 ${DRIVER_SPEC} ${shq(specFile)} ${shq(respFile)}`
+    const cmd = `printf '%s' ${shq(b64(specJson))} | base64 -d > ${shq(specFile)} && ${PY} ${DRIVER_SPEC} ${shq(specFile)} ${shq(respFile)}`
     const r = await run(cmd, exec, { timeoutMs: timeoutMs + 20000 })
     const status = r.stdout.text.trim()
     let respText = null
@@ -352,7 +383,7 @@ export function apply(ctx) {
           'except Exception as ex:',
           '  print("NET_ERR:"+str(ex)[:300])',
         ].join('\n'))
-        const pyCmd = `python3 -c 'import base64,sys; open(sys.argv[1],"wb").write(base64.b64decode(sys.stdin.read()))' ${shq(tmp + '.json')} <<'DSH_EOF'\n${b64(body)}\nDSH_EOF\nprintf '%s' ${py} | base64 -d | python3 - ${shq(tmp + '.json')} ${shq(BASE_URL + '/chat/completions')} ${shq(key)} ${shq(tmp + '.resp')}`
+        const pyCmd = `${PY} -c 'import base64,sys; open(sys.argv[1],"wb").write(base64.b64decode(sys.stdin.read()))' ${shq(tmp + '.json')} <<'DSH_EOF'\n${b64(body)}\nDSH_EOF\nprintf '%s' ${py} | base64 -d | ${PY} - ${shq(tmp + '.json')} ${shq(BASE_URL + '/chat/completions')} ${shq(key)} ${shq(tmp + '.resp')}`
         const r = await run(pyCmd, exec, { timeoutMs: 200000 })
         const out = r.stdout.text.trim()
         if (!out.startsWith('OK')) {
@@ -365,7 +396,7 @@ export function apply(ctx) {
           'b=d["choices"][0]["message"]["audio"]["data"]',
           'open(sys.argv[2],"wb").write(base64.b64decode(b))',
         ].join('\n'))
-        const decRun = await run(`printf '%s' ${dec} | base64 -d | python3 - ${shq(tmp + '.resp')} ${shq(outWsl)}`, exec, { timeoutMs: 30000 })
+        const decRun = await run(`printf '%s' ${dec} | base64 -d | ${PY} - ${shq(tmp + '.resp')} ${shq(outWsl)}`, exec, { timeoutMs: 30000 })
         await run(`rm -f ${shq(tmp + '.json')} ${shq(tmp + '.resp')}`, exec, { timeoutMs: 5000 }).catch(() => {})
         if (decRun.exitCode !== 0) return { ok: false, error: decRun.stderr.text.trim().slice(0, 300) }
         let bytes = 0
@@ -418,7 +449,7 @@ export function apply(ctx) {
           '  open(out,"w").write("NET_ERR:"+str(ex)[:300])',
           '  print("NET_ERR")',
         ].join('\n'))
-        const pyCmd = `printf '%s' ${py} | base64 -d | python3 - ${shq(isUrl ? ref : refWsl)} ${shq(args.text)} ${shq(refMime)} ${shq(fmt)} ${shq(key)} ${shq(BASE_URL + '/chat/completions')} ${shq(tmp + '.resp')}`
+        const pyCmd = `printf '%s' ${py} | base64 -d | ${PY} - ${shq(isUrl ? ref : refWsl)} ${shq(args.text)} ${shq(refMime)} ${shq(fmt)} ${shq(key)} ${shq(BASE_URL + '/chat/completions')} ${shq(tmp + '.resp')}`
         const r = await run(pyCmd, exec, { timeoutMs: 220000 })
         const status = r.stdout.text.trim()
         await run(`rm -f ${shq(tmp + '.json')}`, exec, { timeoutMs: 5000 }).catch(() => {})
@@ -430,7 +461,7 @@ export function apply(ctx) {
             'try: print(open(sys.argv[1],"rb").read().decode("utf-8","replace")[:400])',
             'except Exception: print("")',
           ].join('\n'))
-          const errRun = await run(`printf '%s' ${errPy} | base64 -d | python3 - ${shq(tmp + '.resp')}`, exec, { timeoutMs: 10000 })
+          const errRun = await run(`printf '%s' ${errPy} | base64 -d | ${PY} - ${shq(tmp + '.resp')}`, exec, { timeoutMs: 10000 })
           const errText = (errRun.stdout.text || '').trim()
           await run(`rm -f ${shq(tmp + '.resp')}`, exec, { timeoutMs: 5000 }).catch(() => {})
           return { ok: false, error: errText.replace(/^(HTTP_ERR|NET_ERR):/, '') || status || 'voice clone failed' }
@@ -448,7 +479,7 @@ export function apply(ctx) {
           'except Exception as ex:',
           '  print("ERR:"+str(ex)[:300])',
         ].join('\n'))
-        const extractRun = await run(`printf '%s' ${extractPy} | base64 -d | python3 - ${shq(tmp + '.resp')} ${shq(outWsl)}`, exec, { timeoutMs: 30000 })
+        const extractRun = await run(`printf '%s' ${extractPy} | base64 -d | ${PY} - ${shq(tmp + '.resp')} ${shq(outWsl)}`, exec, { timeoutMs: 30000 })
         await run(`rm -f ${shq(tmp + '.resp')}`, exec, { timeoutMs: 5000 }).catch(() => {})
         if (!extractRun.stdout.text.trim().startsWith('OK')) {
           return { ok: false, error: (extractRun.stdout.text.trim().replace(/^ERR:/, '') || 'failed to decode audio') }
