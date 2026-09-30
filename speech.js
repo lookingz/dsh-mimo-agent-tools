@@ -60,7 +60,7 @@ export function apply(ctx) {
       // MiMo ASR auto-detects by default and accepts explicit hints.
       languages: ['auto', 'zh', 'en'],
     },
-    async transcribe(input, _signal) {
+    async transcribe(input, signal) {
       const started = Date.now()
       // The seam hands us canonical WAV bytes; park them in a temp file the
       // python driver can base64 (its spec takes local file paths in msys form).
@@ -75,7 +75,9 @@ export function apply(ctx) {
           urls: [],
           prompt: '',
           language: asrLanguage(input.language),
-        }, undefined, 110000)
+          // exec-shape carrier: run() forwards exec.signal so an aborted
+          // recording cancels the shell pipeline instead of running to timeout.
+        }, { signal }, 110000)
         if (!res.ok) throw new Error(`MiMo ASR failed: ${res.error}`)
         const text = res.data?.choices?.[0]?.message?.content
         if (typeof text !== 'string') throw new Error('MiMo ASR returned no transcript text')
