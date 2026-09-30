@@ -49,7 +49,7 @@ export function asrLanguage(language) {
 }
 
 export function apply(ctx) {
-  const { runDriver, msysPathOf } = createRuntime(ctx)
+  const { runDriver, winPathOf } = createRuntime(ctx)
   const speechToText = ctx.speechToText
 
   const provider = {
@@ -63,7 +63,8 @@ export function apply(ctx) {
     async transcribe(input, signal) {
       const started = Date.now()
       // The seam hands us canonical WAV bytes; park them in a temp file the
-      // python driver can base64 (its spec takes local file paths in msys form).
+      // python driver can base64 (spec paths travel inside JSON — Windows form,
+      // MSYS never converts file contents).
       const dir = await mkdtemp(join(tmpdir(), 'mimo-stt-'))
       const wav = join(dir, 'audio.wav')
       try {
@@ -71,7 +72,7 @@ export function apply(ctx) {
         const res = await runDriver({
           model: 'mimo-v2.5-asr',
           kind: 'asr',
-          files: [{ kind: 'audio', mime: 'audio/wav', path: msysPathOf(wav) }],
+          files: [{ kind: 'audio', mime: 'audio/wav', path: winPathOf(wav) }],
           urls: [],
           prompt: '',
           language: asrLanguage(input.language),

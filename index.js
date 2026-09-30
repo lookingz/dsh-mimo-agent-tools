@@ -64,6 +64,14 @@ export function createRuntime(ctx) {
     // MSYS converts it back for native executables such as python.exe.
     return /^([A-Za-z]):[\\/]/.test(path) ? '/' + path[0].toLowerCase() + path.slice(2).replace(/\\/g, '/') : String(path).replace(/\\/g, '/')
   }
+  function winPathOf(path) {
+    // Windows form (C:\\Work\\x -> C:/Work/x) for paths that travel INSIDE the
+    // driver spec JSON: MSYS converts only argv paths, never file contents,
+    // so native python.exe cannot open a /c/... path found inside the spec
+    // (reproduced: FileNotFoundError -> "no response"). Shell-side and argv
+    // references keep the /c/ form via wslPathOf.
+    return String(path).replace(/\\/g, '/')
+  }
   function mimeOf(path) {
     // Strip query/fragment so a URL like https://x/a.mp3?token=1 resolves.
     const p = String(path).split(/[?#]/)[0].toLowerCase()
@@ -146,11 +154,11 @@ export function createRuntime(ctx) {
     return { ok: false, error: (t || 'no response').slice(0, 400) }
   }
 
-  return { BASE_URL, TMP_ROOT, KEY_REF, PRESET_VOICES, b64, shq, wslPathOf, msysPathOf, mimeOf, run, resolveKey, runDriver }
+  return { BASE_URL, TMP_ROOT, KEY_REF, PRESET_VOICES, b64, shq, wslPathOf, winPathOf, msysPathOf, mimeOf, run, resolveKey, runDriver }
 }
 
 export function apply(ctx) {
-  const { PRESET_VOICES, shq, wslPathOf, mimeOf, run, resolveKey, runDriver } = createRuntime(ctx)
+  const { PRESET_VOICES, shq, wslPathOf, winPathOf, mimeOf, run, resolveKey, runDriver } = createRuntime(ctx)
 
   const renderJson = (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
   const renderText = (_a, v) => [{ type: 'text', text: typeof v.answer === 'string' ? v.answer : JSON.stringify(v, null, 2) }]
@@ -272,7 +280,7 @@ export function apply(ctx) {
         const urls = []
         for (const img of args.images) {
           if (/^https?:\/\//.test(img) || /^data:/.test(img)) urls.push(img)
-          else locals.push({ kind: 'image', mime: mimeOf(img), path: wslPathOf(img) })
+          else locals.push({ kind: 'image', mime: mimeOf(img), path: winPathOf(img) })
         }
         const res = await runDriver({ model: 'mimo-v2.5', kind: 'vision', files: locals, urls, prompt: args.prompt }, exec)
         if (!res.ok) return { ok: false, error: res.error }
@@ -292,7 +300,7 @@ export function apply(ctx) {
         const isUrl = /^https?:\/\//.test(args.audio) || /^data:/.test(args.audio)
         const res = await runDriver({
           model: 'mimo-v2.5', kind: 'audio',
-          files: isUrl ? [] : [{ kind: 'audio', mime: mimeOf(args.audio), path: wslPathOf(args.audio) }],
+          files: isUrl ? [] : [{ kind: 'audio', mime: mimeOf(args.audio), path: winPathOf(args.audio) }],
           urls: isUrl ? [args.audio] : [],
           prompt: args.prompt || 'Please transcribe the audio content.'
         }, exec)
@@ -315,7 +323,7 @@ export function apply(ctx) {
         const isUrl = /^https?:\/\//.test(args.url) || /^data:/.test(args.url)
         const res = await runDriver({
           model: 'mimo-v2.5', kind: 'video',
-          files: isUrl ? [] : [{ kind: 'video', mime: mimeOf(args.url), path: wslPathOf(args.url) }],
+          files: isUrl ? [] : [{ kind: 'video', mime: mimeOf(args.url), path: winPathOf(args.url) }],
           urls: isUrl ? [args.url] : [],
           prompt: args.prompt || 'Please describe the video content.',
           fps: args.fps,
@@ -338,7 +346,7 @@ export function apply(ctx) {
         const isUrl = /^https?:\/\//.test(args.audio) || /^data:/.test(args.audio)
         const res = await runDriver({
           model: 'mimo-v2.5-asr', kind: 'asr',
-          files: isUrl ? [] : [{ kind: 'audio', mime: mimeOf(args.audio), path: wslPathOf(args.audio) }],
+          files: isUrl ? [] : [{ kind: 'audio', mime: mimeOf(args.audio), path: winPathOf(args.audio) }],
           urls: isUrl ? [args.audio] : [],
           prompt: '',
           language: args.language
