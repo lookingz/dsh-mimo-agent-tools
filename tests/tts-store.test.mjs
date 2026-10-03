@@ -130,12 +130,15 @@ test('mimo_tts store:true synthesizes into long/, records manifest, returns stri
     assert.deepEqual(bodies[0].body.audio, { format: 'wav', voice: '冰糖' })
     // strip render carries the machine envelope the UI parses
     const render = byName.mimo_tts.output.render({ text: '你好世界', store: true }, result)
-    const envelopeBlock = render.find((b) => b.text.trim().startsWith('{'))
+    const envelopeBlock = render.find((b) => b.text.startsWith('{"file"'))
     const envelope = JSON.parse(envelopeBlock.text)
     assert.equal(envelope.audioUrl, result.audioUrl)
     assert.equal(envelope.seconds, 1)
     assert.equal(envelope.inline, true)
     assert.ok(!('notify' in envelope))
+    // no host filesystem path leak into conversation content
+    assert.ok(!JSON.stringify(envelope).includes(audioDir))
+    assert.equal(envelope.file, result.path.split(/[\\/]/).pop())
   } finally {
     globalThis.fetch = realFetch
   }

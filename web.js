@@ -33,7 +33,7 @@ import {
   resolveAudioDir,
   wavDurationSeconds,
 } from "./audio-store.js";
-import { applyStyle, createMiMoClient, resolveTtsTarget, truncateTtsText } from "./mimo.js";
+import { applyStyle, createMiMoClient, resolveTtsTarget, truncateTtsText, voiceTypeOf } from "./mimo.js";
 
 export const ROUTE_PREFIX = "/_dsh/mimo-agent-tools";
 export const SPEAK_ROUTE = `${ROUTE_PREFIX}/speak`;
@@ -275,8 +275,16 @@ export async function performRegenerate(ctx, getConfig, { sessionId, callId } = 
     throw new AudioLookupError("not-found", `no archived speech artifact for session ${sessionId} call ${callId}`);
   }
   const voiceName = (typeof entry.voice === "string" && entry.voice.trim()) ? entry.voice.trim() : DEFAULT_READ_ALOUD_VOICE;
+  // Rebuild the request shape from today's voice map, then OVERRIDE the model
+  // with the manifest-recorded one: the manifest records the model that
+  // actually spoke, so regenerate replays it verbatim (a Config model change
+  // must not silently retune the replay). Recorded style/text/sing ride
+  // as-is. Voiceclone artifacts cannot regenerate — the reference audio was
+  // never stored.
   const target = resolveTtsTarget(tts, voiceMap, voiceName);
-  if (target.needsReference) {
+  const model = (typeof entry.model === "string" && entry.model.trim()) ? entry.model.trim() : target.model;
+  const channel = voiceTypeOf(model);
+  if (channel === "voiceclone") {
     throw new Error(
       `voice "${voiceName}" maps to the voiceclone model, which needs the original reference audio; regenerate is unavailable for it`,
     );
@@ -289,13 +297,13 @@ export async function performRegenerate(ctx, getConfig, { sessionId, callId } = 
   const applied = applyStyle({
     style: styleName,
     sing: entry.sing === true,
-    voiceType: target.voiceType,
+    voiceType: channel,
     userContent: target.userContent,
     text: entry.text ?? "",
   });
   const { text: textToSpeak, truncated } = truncateTtsText(applied.text);
   const { bytes } = await client.speakResolved({
-    model: target.model,
+    model,
     userContent: applied.userContent,
     text: textToSpeak,
     audio: target.audio,
@@ -311,11 +319,11 @@ export async function performRegenerate(ctx, getConfig, { sessionId, callId } = 
     callId,
     text: entry.text ?? "",
     voice: voiceName,
-    model: target.model,
+    model,
     style: styleName,
     sing: entry.sing === true,
   });
-  const result = { id, audioUrl: `${AUDIO_PREFIX}/${id}`, bytes: bytes.length, voice: voiceName, model: target.model, style: styleName, regenerated: true };
+  const result = { id, audioUrl: `${AUDIO_PREFIX}/${id}`, bytes: bytes.length, voice: voiceName, model, style: styleName, regenerated: true };
   if (truncated) result.truncated = true;
   // Keep the loose retention bound honest after restoring an artifact.
   await enforceLongRetention(dir, { count: audio.longRetainCount ?? 200, days: audio.longRetainDays ?? 30 });
@@ -437,7 +445,7 @@ export function installMimoWeb(ctx, getConfig) {
             return;
           }
           res.writeHead(200, {
-            "Content-Type": "audio/wav",
+            "Content-Type": rawId.toLowerCase().endsWith(".mp3") ? "audio/mpeg" : "audio/wav",
             "Content-Length": String(outcome.bytes),
             "Cache-Control": "no-store",
           });

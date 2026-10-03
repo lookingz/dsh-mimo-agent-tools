@@ -120,10 +120,15 @@ node_modules where peer deps resolve against the running harness.
 ## Tests
 
 ```bash
-python3 tests/test_driver.py      # driver request-body assembly (14 cases)
-node --test tests/tools.test.mjs  # tool registration surface
-node --test tests/mimo.test.mjs   # ./mimo TTS/ASR client (mocked fetch)
-node --test tests/speech.test.mjs # speechToText provider surface
+python3 tests/test_driver.py            # driver request-body assembly (14 cases)
+node --test tests/tools.test.mjs        # tool registration surface
+node --test tests/mimo.test.mjs         # ./mimo TTS/ASR client (mocked fetch)
+node --test tests/speech.test.mjs       # speechToText provider surface
+node --test tests/package-surface.test.mjs # exports map + dsh.client contract
+node --test tests/audio-store.test.mjs  # audio store (manifest/retention)
+node --test tests/web.test.mjs          # host routes (speak/audio/regenerate)
+node --test tests/tts-store.test.mjs    # mimo_tts store mode + Config wiring
+# or simply: node --test   (discovers all of the above)
 ```
 
 ## Reusable MiMo client (`./mimo`)

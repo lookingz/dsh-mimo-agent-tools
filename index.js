@@ -23,7 +23,7 @@ import {
   cleanTmp, cleanupSessionArtifacts, enforceLongRetention, initAudioStore,
   manifestAppend, newAudioId, planSpeechArtifact, resolveAudioDir, wavDurationSeconds,
 } from './audio-store.js'
-import { createMiMoClient, resolveTtsTarget } from './mimo.js'
+import { createMiMoClient, applyStyle, isDataOrHttpUrl, resolveTtsTarget, toDataUrl, truncateTtsText } from './mimo.js'
 import { installMimoWeb, DEFAULT_STYLE as UI_DEFAULT_STYLE } from './web.js'
 
 export const name = 'dsh-mimo-agent-tools'
@@ -299,7 +299,9 @@ export async function apply(ctx, config) {
   /**
    * mimo_tts render: bare-file results keep the plain JSON summary; stored
    * results (store:true) add the machine envelope the ./client UI strip
-   * parses (audioUrl/seconds/inline) as a second text block.
+   * parses (audioUrl/seconds/inline) as a second text block. The envelope
+   * carries only the FILE NAME — the host's absolute path must not leak
+   * into conversation content.
    */
   const renderTts = (args, value) => {
     const blocks = [{ type: 'text', text: JSON.stringify(value, null, 2) }]
@@ -307,7 +309,7 @@ export async function apply(ctx, config) {
       blocks.push({
         type: 'text',
         text: JSON.stringify({
-          path: value.path,
+          file: String(value.path || 'mimo-tts.wav').split(/[\\/]/).pop(),
           bytes: value.bytes,
           audioUrl: value.audioUrl,
           seconds: value.seconds,
@@ -321,36 +323,50 @@ export async function apply(ctx, config) {
   /**
    * mimo_tts store mode (decision: explicit `store` flag; the default
    * file-writing behavior is untouched). Synthesizes through the shared
-   * ./mimo client (node fetch — no 64KB shell cap), lands the artifact in
-   * audioDir/long/ + manifest, and returns the strip envelope. The manifest
-   * record {text, voice, model, style, sing} is what POST /regenerate
-   * replays. Applies the Config tts.style default through the shared
-   * applyStyle mixed channel; resolves the voice through the Config voiceMap.
+   * ./mimo client (node fetch — no 64KB shell cap) via speakResolved —
+   * ONE resolution of the target, so the manifest-recorded model is the
+   * model that actually spoke — lands the artifact in audioDir/long/ +
+   * manifest, and returns the strip envelope. The manifest record
+   * {text, voice, model, style, sing} is what POST /regenerate replays.
+   * Applies the Config tts.style default through the shared applyStyle mixed
+   * channel; resolves the voice through the Config voiceMap.
    */
   async function storeSpeak(args, exec) {
     const cfg = currentConfig
     const tts = cfg.tts ?? {}
     const text = typeof args.text === 'string' ? args.text.trim() : ''
-    if (text.trim().length === 0) return { ok: false, error: 'text is required' }
+    if (text.length === 0) return { ok: false, error: 'text is required' }
+    const voiceName = args.voice || tts.voice || 'alloy'
+    const target = resolveTtsTarget(tts, cfg.voiceMap ?? {}, voiceName)
+    const audio = { ...target.audio, format: args.format === 'mp3' ? 'mp3' : (tts.format === 'mp3' ? 'mp3' : 'wav') }
+    if (target.needsReference) {
+      if (!args.reference) {
+        return { ok: false, error: `voice ${JSON.stringify(voiceName)} maps to the voice-clone model, which needs a \`reference\` audio path (a short clip of the voice to clone)` }
+      }
+      audio.voice = isDataOrHttpUrl(args.reference) ? args.reference : toDataUrl(args.reference, mimeOf(args.reference))
+    }
     const style = (typeof args.style === 'string' && args.style.trim()) ? args.style.trim() : tts.style || DEFAULT_TTS_STYLE
-    const client = createMiMoClient({
-      baseUrl: (cfg.provider?.baseUrl || 'https://api.xiaomimimo.com/v1'),
-      apiKey: await resolveKey(),
+    // Style tags apply FIRST, then the final text is truncated — the (style)
+    // prefix must never push the payload past the shared 2500-char limit.
+    const applied = applyStyle({
+      style,
+      sing: args.sing === true,
+      voiceType: target.voiceType,
+      userContent: target.userContent,
+      text,
     })
+    const { text: textToSpeak, truncated } = truncateTtsText(applied.text)
     let bytes
-    let target
     try {
-      target = resolveTtsTarget(tts, cfg.voiceMap ?? {}, args.voice || tts.voice || 'alloy')
-      // The client applies the style (mixed channel), truncates, and handles
-      // the voiceclone reference — single transport for every TTS caller.
-      const out = await client.speak({
-        voice: args.voice || tts.voice || 'alloy',
-        voiceMap: cfg.voiceMap ?? {},
-        text,
-        style,
-        sing: args.sing === true,
-        reference: args.reference,
-        format: args.format === 'mp3' ? 'mp3' : (tts.format || 'wav'),
+      const client = createMiMoClient({
+        baseUrl: (cfg.provider?.baseUrl || 'https://api.xiaomimimo.com/v1'),
+        apiKey: await resolveKey(),
+      })
+      const out = await client.speakResolved({
+        model: target.model,
+        userContent: applied.userContent,
+        text: textToSpeak,
+        audio,
         timeoutMs: tts.timeoutMs || 60000,
       })
       bytes = out.bytes
@@ -362,7 +378,7 @@ export async function apply(ctx, config) {
       audioDir,
       id: newAudioId(),
       text,
-      voice: args.voice || tts.voice || 'alloy',
+      voice: voiceName,
       model: target.model,
       style,
       sing: args.sing === true,
@@ -386,6 +402,7 @@ export async function apply(ctx, config) {
       audioUrl: `/_dsh/mimo-agent-tools/audio/${plan.manifest.id}`,
       style,
     }
+    if (truncated) result.truncated = true
     if (seconds > 0) {
       result.seconds = Math.round(seconds * 10) / 10
       result.inline = !(seconds > (cfg.audio?.inlineThreshold ?? 30))
@@ -587,6 +604,7 @@ export async function apply(ctx, config) {
         output: { type: 'string', description: 'Output path on the Windows side (default C:\\Windows\\Temp\\mimo_tts_<ts>.wav)' },
         format: { type: 'string', description: 'Output audio format: wav (default) or mp3' },
         store: { type: 'boolean', description: 'Store the audio in the plugin audio store and render an in-conversation playable strip (play / download / regenerate) instead of writing a bare file. Voice/style defaults come from the plugin Config (Plugins settings tab).' },
+        reference: { type: 'string', description: 'Reference audio path (local path) or URL for the voice-clone model — required when the mapped voice is a voiceclone target and store: true.' },
         style: { type: 'string', description: 'Optional speaking style (语气): a natural-language instruction such as 温柔/沉稳/轻快, or a full director-style paragraph (角色/场景/指导). With preset voices the style becomes the user instruction; with voicedesign voices it becomes an inline (风格) tag prefix.' }
       },
       output: { schema: { type: 'json' }, render: renderTts },

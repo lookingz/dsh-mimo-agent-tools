@@ -1,5 +1,5 @@
 /**
- * dsh-mimo-agent-tools/client — reusable, ctx-light MiMo TTS/ASR client.
+ * dsh-mimo-agent-tools/mimo — reusable, ctx-light MiMo TTS/ASR client.
  *
  * Absorbs the MiMo HTTPS transport from dsh-voice-mimo (lib/tts.js +
  * lib/web.js) per docs/adr/0001: agent-tools becomes the single MiMo
@@ -124,7 +124,15 @@ export function applyStyle({ style, sing, voiceType, userContent, text }) {
 }
 
 /** True for data: and http(s): URLs — those pass through unwrapped. */
-const isDataOrHttpUrl = (s) => /^(data:|https?:\/\/)/.test(s)
+export const isDataOrHttpUrl = (s) => /^(data:|https?:\/\/)/.test(s)
+
+/** Infer the voice channel from a MiMo TTS model id (regenerate replay). */
+export function voiceTypeOf(model) {
+  const m = String(model || '')
+  if (m.includes('voiceclone')) return 'voiceclone'
+  if (m.includes('voicedesign')) return 'voicedesign'
+  return 'preset'
+}
 
 /**
  * Wrap audio bytes into a data URL. Accepts a base64 string or a

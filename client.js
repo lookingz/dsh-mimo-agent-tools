@@ -348,7 +348,7 @@ window.__ModuleLoader__.load({
         return React.createElement('div', { style: { fontSize: '12px', opacity: 0.75, padding: '4px 2px' } }, text || '…')
       }
 
-      const downloadName = (envelope.path || 'mimo-tts.wav').split(/[\\/]/).pop()
+      const downloadName = (envelope.file || envelope.path || 'mimo-tts.wav').split(/[\\/]/).pop()
       const rowStyle = {
         display: 'flex',
         alignItems: 'center',
