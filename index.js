@@ -1,19 +1,135 @@
-// dsh-mimo-agent-tools — Xiaomi MiMo search + multimodal tools.
+// dsh-mimo-agent-tools — Xiaomi MiMo search + multimodal tools + voice UI host.
 // Installed as a DSH bundle (`dsh plugin --profile <name> add .`).
 // Registers mimo_search / mimo_vision / mimo_audio / mimo_video / mimo_asr /
-// mimo_tts as model tools.
+// mimo_tts / mimo_voiceclone as model tools, plus (since #4, docs/adr/0001)
+// the host half of the merged voice UI: 🔊 read-aloud + speech-strip web
+// routes (web.js) over the audio store (audio-store.js), configured through
+// the plugin Config (Plugins settings tab).
 //
 // The API key is resolved from the DSH credentials service (key
 // XIAOMI_API_KEY, written by the web Models page). The python driver path is
 // shell-expanded (${MIMO_DRIVER:-$HOME/.local/lib/...}) because the plugin
 // sandbox has no process.env. Large base64 payloads are handled entirely
-// inside the python driver to dodge the 64KB shell stdout cap.
+// inside the python driver to dodge the 64KB shell stdout cap; the UI/store
+// routes use the ./mimo client (node fetch — no cap) instead.
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import z from '@deepseek-ai/schemastery'
 import { existsSync } from 'node:fs'
+import { writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import {
+  cleanTmp, cleanupSessionArtifacts, enforceLongRetention, initAudioStore,
+  manifestAppend, newAudioId, planSpeechArtifact, resolveAudioDir, wavDurationSeconds,
+} from './audio-store.js'
+import { createMiMoClient, resolveTtsTarget } from './mimo.js'
+import { installMimoWeb, DEFAULT_STYLE as UI_DEFAULT_STYLE } from './web.js'
 
 export const name = 'dsh-mimo-agent-tools'
 export const inject = ['tools', 'shell', 'sandboxPolicy', 'credentials', 'skills']
+
+/** Default style for 🔊 read-aloud and mimo_tts store mode (朗读语气). */
+export const DEFAULT_TTS_STYLE = UI_DEFAULT_STYLE
+
+/** Default voice map: OpenAI voice names → MiMo presets (Plugins settings tab editable). */
+export const DEFAULT_VOICE_MAP = {
+  alloy: { type: 'preset', voice: '冰糖' },
+  echo: { type: 'preset', voice: '苏打' },
+  fable: { type: 'preset', voice: '茉莉' },
+  onyx: { type: 'preset', voice: '白桦' },
+  nova: { type: 'preset', voice: 'Mia' },
+  shimmer: { type: 'preset', voice: 'mimo_default' },
+}
+
+const voiceMapSchema = z.dict(
+  z.object({
+    type: z.union([z.const('preset'), z.const('voicedesign')]).required(),
+    /** MiMo preset ID when type=preset; free-form Chinese voice description when type=voicedesign. */
+    voice: z.string().required(),
+    /**
+     * Optional model override. Empty = inferred from type
+     * (preset → mimo-v2.5-tts, voicedesign → mimo-v2.5-tts-voicedesign).
+     * Set it to route this voice through mimo-v2.5-tts-voiceclone for a
+     * cloned timbre (needs a reference clip at call time).
+     */
+    model: z.string().default(''),
+  }),
+)
+
+/**
+ * Plugin Config — surfaced through the alpha.1 Plugins settings tab
+ * (SettingsForms projection, settings.plugins.tab). Replaces the retired
+ * voice-mimo custom Settings page + settings namespace shim.
+ */
+export const Config = z.object({
+  /** MiMo provider: base URL and DSH Credential reference. */
+  provider: z
+    .object({
+      baseUrl: z.string().default('https://api.xiaomimimo.com/v1'),
+      credential: z.string().default('XIAOMI_API_KEY'),
+    })
+    .default({}),
+  /** Voice map: OpenAI voice name → MiMo preset or voice design. */
+  voiceMap: voiceMapSchema.default(DEFAULT_VOICE_MAP),
+  /** Audio output storage: layered tmp/ + long/ under audioDir. */
+  audio: z
+    .object({
+      /** Root of the audio subtree. Empty = <dshHome>/cache/dsh-mimo-agent-tools. */
+      dir: z.string().default(''),
+      /** Inline-vs-card threshold (seconds) for in-conversation speech strips. */
+      inlineThreshold: z.number().min(1).default(30),
+      /** Loose long-term retention fallback. */
+      longRetainCount: z.number().min(1).default(200),
+      longRetainDays: z.number().min(1).default(30),
+    })
+    .default({}),
+  /** 🔊 read-aloud + mimo_tts store mode defaults. */
+  tts: z
+    .object({
+      model: z.string().default('mimo-v2.5-tts'),
+      format: z.string().default('wav'),
+      timeoutMs: z.number().min(1).default(60000),
+      /** Read-aloud voice: a voiceMap key (default alloy→冰糖). */
+      voice: z.string().default('alloy'),
+      /** Read-aloud style (朗读语气), default 温柔. */
+      style: z.string().default(DEFAULT_TTS_STYLE),
+    })
+    .default({}),
+})
+
+let currentConfig = {}
+
+/** Fill Config defaults by hand (schemastery z.object has no .parse). */
+function safeConfigOf(raw) {
+  const c = raw ?? {}
+  const provider = c.provider ?? {}
+  const audio = c.audio ?? {}
+  const tts = c.tts ?? {}
+  return {
+    provider: {
+      baseUrl: provider.baseUrl || 'https://api.xiaomimimo.com/v1',
+      credential: provider.credential || 'XIAOMI_API_KEY',
+    },
+    voiceMap: c.voiceMap ?? DEFAULT_VOICE_MAP,
+    audio: {
+      dir: audio.dir ?? '',
+      inlineThreshold: audio.inlineThreshold ?? 30,
+      longRetainCount: audio.longRetainCount ?? 200,
+      longRetainDays: audio.longRetainDays ?? 30,
+    },
+    tts: {
+      model: tts.model || 'mimo-v2.5-tts',
+      format: tts.format ?? 'wav',
+      timeoutMs: tts.timeoutMs ?? 60000,
+      voice: tts.voice || 'alloy',
+      style: (tts.style && tts.style.trim()) || DEFAULT_TTS_STYLE,
+    },
+  }
+}
+
+/** Live plugin Config getter (web routes read per request). */
+const getConfig = () => currentConfig
 
 /**
  * Default model for mimo_audio (audio understanding). Migrated from
@@ -165,8 +281,9 @@ export function createRuntime(ctx) {
   return { BASE_URL, TMP_ROOT, KEY_REF, PRESET_VOICES, b64, shq, wslPathOf, winPathOf, msysPathOf, mimeOf, run, resolveKey, runDriver }
 }
 
-export function apply(ctx) {
+export async function apply(ctx, config) {
   const { PRESET_VOICES, shq, wslPathOf, winPathOf, mimeOf, run, resolveKey, runDriver } = createRuntime(ctx)
+  currentConfig = safeConfigOf(config)
 
   const renderJson = (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
   const renderText = (_a, v) => [{ type: 'text', text: typeof v.answer === 'string' ? v.answer : JSON.stringify(v, null, 2) }]
@@ -177,6 +294,103 @@ export function apply(ctx) {
     }
     lines.push(typeof v.answer === 'string' ? v.answer : JSON.stringify(v, null, 2))
     return [{ type: 'text', text: lines.join('\n\n') }]
+  }
+
+  /**
+   * mimo_tts render: bare-file results keep the plain JSON summary; stored
+   * results (store:true) add the machine envelope the ./client UI strip
+   * parses (audioUrl/seconds/inline) as a second text block.
+   */
+  const renderTts = (args, value) => {
+    const blocks = [{ type: 'text', text: JSON.stringify(value, null, 2) }]
+    if (value.audioUrl) {
+      blocks.push({
+        type: 'text',
+        text: JSON.stringify({
+          path: value.path,
+          bytes: value.bytes,
+          audioUrl: value.audioUrl,
+          seconds: value.seconds,
+          inline: value.inline,
+        }),
+      })
+    }
+    return blocks
+  }
+
+  /**
+   * mimo_tts store mode (decision: explicit `store` flag; the default
+   * file-writing behavior is untouched). Synthesizes through the shared
+   * ./mimo client (node fetch — no 64KB shell cap), lands the artifact in
+   * audioDir/long/ + manifest, and returns the strip envelope. The manifest
+   * record {text, voice, model, style, sing} is what POST /regenerate
+   * replays. Applies the Config tts.style default through the shared
+   * applyStyle mixed channel; resolves the voice through the Config voiceMap.
+   */
+  async function storeSpeak(args, exec) {
+    const cfg = currentConfig
+    const tts = cfg.tts ?? {}
+    const text = typeof args.text === 'string' ? args.text.trim() : ''
+    if (text.trim().length === 0) return { ok: false, error: 'text is required' }
+    const style = (typeof args.style === 'string' && args.style.trim()) ? args.style.trim() : tts.style || DEFAULT_TTS_STYLE
+    const client = createMiMoClient({
+      baseUrl: (cfg.provider?.baseUrl || 'https://api.xiaomimimo.com/v1'),
+      apiKey: await resolveKey(),
+    })
+    let bytes
+    let target
+    try {
+      target = resolveTtsTarget(tts, cfg.voiceMap ?? {}, args.voice || tts.voice || 'alloy')
+      // The client applies the style (mixed channel), truncates, and handles
+      // the voiceclone reference — single transport for every TTS caller.
+      const out = await client.speak({
+        voice: args.voice || tts.voice || 'alloy',
+        voiceMap: cfg.voiceMap ?? {},
+        text,
+        style,
+        sing: args.sing === true,
+        reference: args.reference,
+        format: args.format === 'mp3' ? 'mp3' : (tts.format || 'wav'),
+        timeoutMs: tts.timeoutMs || 60000,
+      })
+      bytes = out.bytes
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+    const audioDir = resolveAudioDir(cfg, resolveDshHome())
+    const plan = planSpeechArtifact({
+      audioDir,
+      id: newAudioId(),
+      text,
+      voice: args.voice || tts.voice || 'alloy',
+      model: target.model,
+      style,
+      sing: args.sing === true,
+      // agent.id is the branded SessionId (the whole agent.session object is
+      // the live session, not its identifier).
+      sessionId: exec?.agent?.id ?? null,
+      callId: exec?.callId ?? null,
+    })
+    await initAudioStore(audioDir)
+    await writeFile(plan.path, bytes)
+    await manifestAppend(audioDir, plan.manifest)
+    await enforceLongRetention(audioDir, {
+      count: cfg.audio?.longRetainCount ?? 200,
+      days: cfg.audio?.longRetainDays ?? 30,
+    })
+    const seconds = wavDurationSeconds(bytes)
+    const result = {
+      ok: true,
+      path: plan.path,
+      bytes: bytes.length,
+      audioUrl: `/_dsh/mimo-agent-tools/audio/${plan.manifest.id}`,
+      style,
+    }
+    if (seconds > 0) {
+      result.seconds = Math.round(seconds * 10) / 10
+      result.inline = !(seconds > (cfg.audio?.inlineThreshold ?? 30))
+    }
+    return result
   }
 
   const tools = [
@@ -372,10 +586,12 @@ export function apply(ctx) {
         voice: { type: 'string', description: 'Preset voice ID or custom voice description (default mimo_default)' },
         output: { type: 'string', description: 'Output path on the Windows side (default C:\\Windows\\Temp\\mimo_tts_<ts>.wav)' },
         format: { type: 'string', description: 'Output audio format: wav (default) or mp3' },
+        store: { type: 'boolean', description: 'Store the audio in the plugin audio store and render an in-conversation playable strip (play / download / regenerate) instead of writing a bare file. Voice/style defaults come from the plugin Config (Plugins settings tab).' },
         style: { type: 'string', description: 'Optional speaking style (语气): a natural-language instruction such as 温柔/沉稳/轻快, or a full director-style paragraph (角色/场景/指导). With preset voices the style becomes the user instruction; with voicedesign voices it becomes an inline (风格) tag prefix.' }
       },
-      output: { schema: { type: 'json' }, render: renderJson },
+      output: { schema: { type: 'json' }, render: renderTts },
       async execute(args, exec) {
+        if (args.store === true) return storeSpeak(args, exec)
         const key = await resolveKey()
         const fmt = args.format === 'mp3' ? 'mp3' : 'wav'
         const outPath = args.output || `C:\\Windows\\Temp\\mimo_tts_${Date.now()}.${fmt}`
@@ -524,8 +740,14 @@ export function apply(ctx) {
     ctx.tools.register(defineTool(tool))
   }
 
+  // Voice UI host routes (🔊 read-aloud + audio streaming + regenerate +
+  // archive cleanup) — the browser half is the ./client entry.
+  installMimoWeb(ctx, getConfig)
+
   // audio-tools skill: guidance for the MiMo audio toolset (transcribe /
-  // speak / voiceclone / understand). The tools themselves are always
+  // speak / voiceclone / understand). Registered synchronously, before any
+  // await, so consumers reading apply()'s side effects without awaiting see
+  // tools + routes + skill together. The tools themselves are always
   // registered — they are lightweight pure-API calls, unlike vision-toolkit's
   // ten schemas — so this skill only teaches when to use which, and notes
   // what each call sends to the MiMo API.
@@ -541,7 +763,7 @@ export function apply(ctx) {
       '## Tools',
       '',
       '- **mimo_asr** — transcribe an audio file (wav/mp3, local path or URL) to text with the MiMo ASR model. Optionally pass `language` (e.g. zh, en) for a hint.',
-      '- **mimo_tts** — synthesize text into a .wav/.mp3 file. `voice` is a preset ID (mimo_default/冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dean) or a free-form Chinese voice description (uses the voicedesign model). `style` adds a speaking tone; `format` picks wav (default) or mp3. Output lands on the Windows side (default C:\\Windows\\Temp).',
+      '- **mimo_tts** — synthesize text into a .wav/.mp3 file. `voice` is a preset ID (mimo_default/冰糖/茉莉/苏打/白桦/Mia/Chloe/Milo/Dean) or a free-form Chinese voice description (uses the voicedesign model). `style` adds a speaking tone; `format` picks wav (default) or mp3. Output lands on the Windows side (default C:\\Windows\\Temp). With `store: true` the audio goes to the plugin audio store instead and a playable strip (play/download/regenerate) appears in the conversation — use it when the speech is FOR the user in this conversation; voice/style then default to the plugin Config (朗读音色/朗读语气).',
       '- **mimo_voiceclone** — clone a voice: give a short reference audio clip (local path or URL) plus target text; output is speech in the reference speaker\'s voice. `format` picks wav (default) or mp3.',
       '- **mimo_audio** — understand the content of an audio file (wav/mp3/flac/ogg/m4a): summarize, extract information, or answer questions about what is said or played.',
       '',
@@ -559,5 +781,42 @@ export function apply(ctx) {
     // A duplicate or invalid registration must not take the plugin down.
     const logger = ctx.logger
     logger?.warn?.('dsh-mimo-agent-tools: audio-tools skill registration failed: %s', error instanceof Error ? error.message : String(error))
+  }
+
+  // Audio storage skeleton: create tmp/ + long/ under audioDir, clear the
+  // previous process's tmp/ leftovers (idempotent), then run the startup
+  // sweep — loose retention + archived-session long/ cleanup (#5 semantics).
+  // This is the only await-ed part of apply(); everything above (tools,
+  // routes, skill) registers synchronously.
+  try {
+    const audioDir = resolveAudioDir(currentConfig.audio, resolveDshHome())
+    await initAudioStore(audioDir)
+    await cleanTmp(audioDir)
+    ctx.logger?.info?.(`[dsh-mimo-agent-tools] audioDir ready at ${audioDir} (tmp cleaned)`)
+    try {
+      const audio = currentConfig.audio ?? {}
+      const retention = await enforceLongRetention(audioDir, {
+        count: audio.longRetainCount ?? 200,
+        days: audio.longRetainDays ?? 30,
+      })
+      if (retention.removed > 0) {
+        ctx.logger?.info?.(`[dsh-mimo-agent-tools] retention removed ${retention.removed} long-term artifacts`)
+      }
+      const archived = ctx.workspaceRegistry?.archivedSessionIds ?? []
+      for (const sessionId of archived) {
+        const outcome = await cleanupSessionArtifacts(audioDir, sessionId)
+        if (outcome.removed > 0) {
+          ctx.logger?.info?.(`[dsh-mimo-agent-tools] startup sweep cleaned ${outcome.removed} artifact(s) of archived session ${sessionId}`)
+        }
+      }
+    } catch (error) {
+      ctx.logger?.warn?.(
+        `[dsh-mimo-agent-tools] startup sweep failed (retention/archived cleanup will retry on demand): ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  } catch (error) {
+    ctx.logger?.warn?.(
+      `[dsh-mimo-agent-tools] audioDir init failed: ${error instanceof Error ? error.message : String(error)} — 🔊 read-aloud will retry per request`,
+    )
   }
 }

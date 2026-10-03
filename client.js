@@ -1,233 +1,503 @@
 /**
- * dsh-mimo-agent-tools/client — reusable, ctx-light MiMo TTS/ASR client.
+ * dsh-mimo-agent-tools/client — browser UI half (ported from dsh-voice-mimo,
+ * per docs/adr/0001 single-repo merge; issue #4, absorbing voice-mimo
+ * #13/#16). DSH client-bundler convention: the `./client` export is the web
+ * entry, loaded via window.__ModuleLoader__ with the modules declared in
+ * package.json `dsh.client.inject` available to `require`.
  *
- * Absorbs the MiMo HTTPS transport from dsh-voice-mimo (lib/tts.js +
- * lib/web.js) per docs/adr/0001: agent-tools becomes the single MiMo
- * transport and voice-mimo imports this client instead of carrying its own.
+ * Merged in:
+ *  - 🔊 read-aloud SpeakerButton at `conversation.chat.assistant-actions` —
+ *    click → POST /_dsh/mimo-agent-tools/speak → the host synthesizes through
+ *    the shared ./mimo client → <audio> plays the same-origin audioUrl.
+ *    (Read-aloud fix: react is declared in dsh.client.inject and the module
+ *    id matches the package name — the voice-mimo breakage root cause was the
+ *    factory requiring an undeclared module at load time.)
+ *  - In-conversation speech strip (play / download / regenerate) for
+ *    `mimo_tts` results stored via the store flag (tool.call.toolview); the
+ *    machine envelope the host render emits carries audioUrl/seconds/inline.
+ *  - Archived-session cleanup watcher (host/archived-sessions-changed only
+ *    reaches the client runtime; this half drives the host cleanup route).
  *
- * Deliberately ctx-light: no shell, no sandboxPolicy, no credentials
- * service, no DSH imports — the caller passes an apiKey (resolved however
- * it likes) and may inject `fetchImpl` for tests. The python-driver route
- * (createRuntime in index.js) is untouched; those tools keep running
- * through the shell pipeline where the 64KB stdout cap matters.
+ * Dropped from the voice-mimo port (issue #4): 🎤 MicButton (the official
+ * speechToText seam in ./speech covers it), 🧠 UnderstandButton (mimo_audio),
+ * auto read-aloud/notify (never used — retired with the feature), the custom
+ * Settings page (voice map lives in plugin Config, rendered by the Plugins
+ * settings tab), and the client diagnostic log (log route retired with it).
  *
- * Voice-map semantics (preset / voicedesign / voiceclone) stay
- * caller-configurable: pass a voiceMap to speak() or resolve your own
- * target with resolveTtsTarget and call speak with it.
+ * Plain JavaScript, no JSX — elements via React.createElement.
  */
 
-const DEFAULT_BASE_URL = 'https://api.xiaomimimo.com/v1'
+window.__ModuleLoader__.load({
+  id: 'dsh-mimo-agent-tools',
+  factory: (require) => {
+    var module = { exports: {} }
+    var exports = module.exports
 
-/** MiMo TTS preset voices (mimo-v2.5-tts accepts these directly). */
-export const PRESET_VOICES = new Set(['mimo_default', '冰糖', '茉莉', '苏打', '白桦', 'Mia', 'Chloe', 'Milo', 'Dean'])
+    const React = require('react')
+    const { useState, useRef, useEffect } = React
 
-/** Official guidance: segment TTS text beyond this many characters. */
-export const MAX_TTS_TEXT_CHARS = 2500
+    const inject = ['slots', 'workspaces']
 
-/**
- * Truncate TTS target text to MAX_TTS_TEXT_CHARS (codepoint-safe). Returns
- * { text, truncated } — a silent over-limit request would fail at the API,
- * so we cut explicitly and let the caller surface the flag.
- */
-export function truncateTtsText(text) {
-  const t = String(text ?? '')
-  if (t.length <= MAX_TTS_TEXT_CHARS) return { text: t, truncated: false }
-  return { text: Array.from(t).slice(0, MAX_TTS_TEXT_CHARS).join(''), truncated: true }
-}
+    const SPEAK_ROUTE = '/_dsh/mimo-agent-tools/speak'
+    const REGENERATE_ROUTE = '/_dsh/mimo-agent-tools/regenerate'
+    const ARCHIVE_CLEANUP_ROUTE = '/_dsh/mimo-agent-tools/archive-cleanup'
 
-/**
- * Resolve a voice name against the voiceMap into a concrete MiMo TTS target:
- *   { model, voiceType, userContent, audio, needsReference }
- *
- * voiceType ∈ preset | voicedesign | voiceclone — the style-channel decision
- * (applyStyle) keys off it. Mirrors dsh-voice-mimo's voice_speak semantics:
- * preset → mimo-v2.5-tts with audio.voice; voicedesign → -voicedesign with
- * optimize_text_preview; voiceclone → -voiceclone, needs a reference audio.
- *
- * `voiceMap` is caller-owned (the voice-mimo Settings migration lives in
- * #4): entries may carry { model, type: 'voicedesign', voice } or
- * { model: '<...tts-voiceclone>' }. An unmapped non-preset name is treated
- * as a voicedesign description.
- */
-export function resolveTtsTarget(cfg, voiceMap, voiceName) {
-  const mapped = voiceMap?.[voiceName]
-  const mappedModel = mapped?.model || ''
-  if (mappedModel.includes('voiceclone')) {
-    return {
-      model: mappedModel,
-      voiceType: 'voiceclone',
-      userContent: 'Use this reference voice to speak the following text naturally.',
-      audio: { format: 'wav' },
-      needsReference: true,
+    // ──────────────────────────────────────────────────────────────────────────
+    // Shared single-playback registry: starting one sound stops the others
+    // (mirrors the old global speechSynthesis.cancel() semantics).
+    // ──────────────────────────────────────────────────────────────────────────
+    let activeAudio = null
+    const audioStopListeners = new Set()
+    function notifyAudioStopped() {
+      for (const fn of audioStopListeners) fn()
     }
-  }
-  if (mapped !== undefined && mapped.type === 'voicedesign') {
-    return {
-      model: mapped.model || 'mimo-v2.5-tts-voicedesign',
-      voiceType: 'voicedesign',
-      userContent: mapped.voice,
-      audio: { format: 'wav', optimize_text_preview: true },
-      needsReference: false,
-    }
-  }
-  // A bare non-preset name is a voicedesign description (mirrors the
-  // mimo_tts tool semantics in index.js); the mimo_default fallback for a
-  // missing voice happens at the speak() level, not here.
-  const preset = mapped !== undefined ? mapped.voice : voiceName
-  if (!PRESET_VOICES.has(preset)) {
-    return {
-      model: mapped?.model || 'mimo-v2.5-tts-voicedesign',
-      voiceType: 'voicedesign',
-      userContent: preset,
-      audio: { format: 'wav', optimize_text_preview: true },
-      needsReference: false,
-    }
-  }
-  return {
-    model: mapped?.model || cfg?.model || 'mimo-v2.5-tts',
-    voiceType: 'preset',
-    userContent: 'Speak the following text naturally.',
-    audio: { format: 'wav', voice: preset },
-    needsReference: false,
-  }
-}
-
-/**
- * Apply the style/sing decisions to one TTS request:
- * - preset / voiceclone → the style rides the USER message (voiceclone
- *   appends so the clone directive survives).
- * - voicedesign → the user message is owned by the voice description, so
- *   the style moves to an inline tag prefix `(style)` on the assistant text.
- * - sing → a bare `(唱歌)` prefix; preset-only (verified: a combined
- *   bracket drifts the model into reading instead of singing).
- * Returns { userContent, text }.
- */
-export function applyStyle({ style, sing, voiceType, userContent, text }) {
-  const s = typeof style === 'string' ? style.trim() : ''
-  let nextUser = userContent
-  let nextText = String(text ?? '')
-  if (sing === true) {
-    if (voiceType !== 'preset') {
-      throw new Error(`singing requires a preset voice (mimo-v2.5-tts); the resolved voice type is ${voiceType}`)
-    }
-    nextText = `(唱歌)${nextText}`
-  } else if (s) {
-    if (voiceType === 'voicedesign') {
-      nextText = `(${s})${nextText}`
-    } else if (voiceType === 'voiceclone') {
-      nextUser = nextUser ? `${nextUser} ${s}` : s
-    } else {
-      nextUser = s
-    }
-  }
-  return { userContent: nextUser, text: nextText }
-}
-
-/** True for data: and http(s): URLs — those pass through unwrapped. */
-const isDataOrHttpUrl = (s) => /^(data:|https?:\/\/)/.test(s)
-
-/**
- * Wrap audio bytes into a data URL. Accepts a base64 string or a
- * Buffer/Uint8Array. Used for ASR input_audio and voiceclone references —
- * both travel inside the JSON body (fetch has no stdout cap).
- */
-export function toDataUrl(input, mime = 'audio/wav') {
-  const b64 = typeof input === 'string' && !isDataOrHttpUrl(input)
-    ? input
-    : Buffer.from(input).toString('base64')
-  return `data:${mime};base64,${b64}`
-}
-
-/**
- * Create a MiMo TTS/ASR client. apiKey is required (plain string — the
- * caller decides how it is resolved); baseUrl and fetchImpl are optional.
- */
-export function createMiMoClient({ baseUrl = DEFAULT_BASE_URL, apiKey, fetchImpl } = {}) {
-  const url = baseUrl.replace(/\/+$/, '') + '/chat/completions'
-  const doFetch = fetchImpl ?? globalThis.fetch
-
-  async function post(payload, timeoutMs, label) {
-    let response
-    try {
-      response = await doFetch(url, {
-        method: 'POST',
-        headers: { 'api-key': apiKey, 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(timeoutMs),
-      })
-    } catch (error) {
-      throw new Error(`MiMo ${label} request failed: ${error instanceof Error ? error.message : String(error)}`)
-    }
-    if (!response.ok) {
-      const text = await response.text().catch(() => '')
-      throw new Error(`MiMo ${label} HTTP ${response.status}: ${text.slice(0, 400)}`)
-    }
-    return await response.json()
-  }
-
-  /**
-   * Synthesize speech. Returns { bytes: Buffer, mime, truncated }.
-   * - voice: preset id, free-form voicedesign description, or a voiceMap key
-   * - voiceMap: caller-owned map (see resolveTtsTarget)
-   * - model: optional override for the preset-TTS model (default
-   *   mimo-v2.5-tts); voiceMap entries may also carry their own model
-   * - reference: REQUIRED for voiceclone voices — a data URL (or
-   *   base64/Buffer + referenceMime) of the short reference clip
-   * - style / sing: see applyStyle; format: 'wav' (default) | 'mp3'
-   */
-  async function speak({ voice, text, voiceMap, model, reference, referenceMime = 'audio/wav', style, sing, format = 'wav', timeoutMs = 120000 }) {
-    const target = resolveTtsTarget({ model }, voiceMap, voice ?? 'mimo_default')
-    const cut = truncateTtsText(text)
-    let { userContent, text: bodyText } = applyStyle({
-      style, sing, voiceType: target.voiceType, userContent: target.userContent, text: cut.text,
-    })
-    const audio = { ...target.audio, format: format === 'mp3' ? 'mp3' : 'wav' }
-    if (target.needsReference) {
-      if (reference === undefined || reference === null || reference === '') {
-        throw new Error(`voice "${voice}" is a voiceclone target and requires a reference clip`)
+    function stopActiveAudio() {
+      if (activeAudio) {
+        try { activeAudio.pause(); } catch (_) { /* ignore */ }
+        activeAudio = null
+        notifyAudioStopped()
       }
-      audio.voice = typeof reference === 'string' && isDataOrHttpUrl(reference)
-        ? reference
-        : toDataUrl(reference, referenceMime)
     }
-    const data = await post({
-      model: target.model,
-      messages: [
-        { role: 'user', content: userContent },
-        { role: 'assistant', content: bodyText },
-      ],
-      audio,
-    }, timeoutMs, 'TTS')
-    const base64 = data?.choices?.[0]?.message?.audio?.data
-    if (typeof base64 !== 'string' || base64.length === 0) {
-      throw new Error('MiMo TTS returned no audio data')
+    // Stop whatever else is playing WITHOUT letting the notify loop reset the
+    // caller's own state (the caller asserts its state right after).
+    function stopOthersExcept(handler) {
+      if (handler) audioStopListeners.delete(handler)
+      try {
+        stopActiveAudio()
+      } finally {
+        if (handler) audioStopListeners.add(handler)
+      }
     }
-    return { bytes: Buffer.from(base64, 'base64'), mime: `audio/${format === 'mp3' ? 'mpeg' : 'wav'}`, truncated: cut.truncated }
-  }
 
-  /**
-   * Transcribe audio to text with mimo-v2.5-asr. `audio` is a base64
-   * string, a data URL/HTTP URL (passed through as-is), or raw bytes +
-   * mimeType (default audio/wav). Returns { text }.
-   */
-  async function transcribe({ audio, mimeType = 'audio/wav', language, timeoutMs = 120000 }) {
-    if (audio === undefined || audio === null || audio === '') {
-      throw new Error('transcribe requires audio (base64, data URL, or bytes)')
-    }
-    const data_url = typeof audio === 'string' && isDataOrHttpUrl(audio)
-      ? audio
-      : toDataUrl(audio, mimeType)
-    const payload = {
-      model: 'mimo-v2.5-asr',
-      messages: [{ role: 'user', content: [{ type: 'input_audio', input_audio: { data: data_url } }] }],
-      stream: false,
-    }
-    if (typeof language === 'string' && language.trim() !== '') payload.asr_options = { language }
-    const data = await post(payload, timeoutMs, 'ASR')
-    const content = data?.choices?.[0]?.message?.content
-    if (typeof content !== 'string') throw new Error('MiMo ASR returned no transcript text')
-    return { text: content.trim() }
-  }
+    // ──────────────────────────────────────────────────────────────────────────
+    // 🔊 Speaker button — read one assistant reply aloud with MiMo TTS
+    // ──────────────────────────────────────────────────────────────────────────
+    // Click → POST /speak → the host synthesizes via the ./mimo client into
+    // audioDir/tmp → <audio> plays the returned audioUrl. Voice/style come
+    // from plugin Config (朗读音色/朗读语气, Plugins settings tab), resolved
+    // host-side, so a config change applies to the next click immediately.
+    //
+    // Playback states: idle → busy (synthesizing) → playing (click to stop) |
+    // ready (autoplay blocked by browser policy; click plays the loaded file).
+    function SpeakerButton(props) {
+      const { messageId, useSession } = props
+      const [state, setState] = useState('idle') // idle | busy | playing | ready
+      const audioRef = useRef(null)
+      const abortRef = useRef(null)
+      const stopHandlerRef = useRef(null)
 
-  return { speak, transcribe, url }
-}
+      // session-scope slots inject `useSession` as a SELECTOR hook over the
+      // current session snapshot. Chat nodes are view wrappers: kind
+      // 'assistant-step' with the message under data.finalNode (messageId +
+      // blocks) — extract the text inside the selector so streaming stays fresh.
+      const text = typeof useSession === 'function'
+        ? useSession((s) => {
+            const nodes = s?.chat?.nodes?.values?.() ?? []
+            const node = nodes.find((n) => (
+              n && n.kind === 'assistant-step' && n.data &&
+              n.data.finalNode && n.data.finalNode.messageId === messageId
+            ))
+            const blocks = node && node.data && node.data.finalNode ? node.data.finalNode.blocks : null
+            if (!Array.isArray(blocks)) return ''
+            return blocks
+              .filter((b) => b && b.kind === 'text' && b.text)
+              .map((b) => b.text)
+              .join('\n')
+              .trim()
+          })
+        : ''
+
+      useEffect(() => {
+        // Any other message starting playback stops us.
+        const handleStop = () => setState('idle')
+        stopHandlerRef.current = handleStop
+        audioStopListeners.add(handleStop)
+        return () => {
+          audioStopListeners.delete(handleStop)
+          if (abortRef.current) { try { abortRef.current.abort(); } catch (_) { /* ignore */ } }
+          const a = audioRef.current
+          if (a) {
+            try { a.pause(); a.removeAttribute('src'); } catch (_) { /* ignore */ }
+          }
+          if (activeAudio === a) activeAudio = null
+        }
+      }, [])
+
+      const playAudio = (url) => {
+        stopOthersExcept(stopHandlerRef.current)
+        const a = new Audio(url)
+        audioRef.current = a
+        activeAudio = a
+        const settle = () => { setState('idle'); if (activeAudio === a) activeAudio = null; }
+        a.onended = settle
+        a.onerror = () => {
+          setState('idle')
+          if (activeAudio === a) activeAudio = null
+          window.alert('音频播放失败：' + String((a.error && a.error.message) || 'unknown'))
+        }
+        const promise = a.play()
+        if (promise && typeof promise.catch === 'function') {
+          promise.catch(() => {
+            // Autoplay policy: keep the loaded file, ask for one more click
+            // (Chrome requires a user gesture for play() with sound).
+            if (a === audioRef.current) setState('ready')
+            if (activeAudio === a) activeAudio = null
+          })
+        }
+      }
+
+      const speak = () => {
+        if (state === 'busy') return
+        if (state === 'playing') {
+          stopActiveAudio()
+          return
+        }
+        if (state === 'ready' && audioRef.current) {
+          // Playback was blocked before; this click is a user gesture.
+          stopOthersExcept(stopHandlerRef.current)
+          setState('playing')
+          const a = audioRef.current
+          activeAudio = a
+          const promise = a.play()
+          if (promise && typeof promise.catch === 'function') {
+            promise.catch(() => {
+              setState('idle')
+              if (activeAudio === a) activeAudio = null
+            })
+          }
+          return
+        }
+        if (!text) return
+        setState('busy')
+        const ctrl = new AbortController()
+        abortRef.current = ctrl
+        fetch(SPEAK_ROUTE, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text }),
+          signal: ctrl.signal,
+        })
+          .then((r) => r.json())
+          .then((d) => {
+            if (!d.ok) throw new Error(d.error?.message || 'synthesis failed')
+            setState('playing')
+            playAudio(d.value.audioUrl)
+          })
+          .catch((err) => {
+            if (err && err.name === 'AbortError') return
+            setState('idle')
+            window.alert('语音合成失败：' + ((err && err.message) || err))
+          })
+      }
+
+      const busy = state === 'busy'
+      const speaking = state === 'playing'
+      return React.createElement(
+        'button',
+        {
+          type: 'button',
+          className:
+            'dsh-voice-btn dsh-voice-speaker' +
+            (busy || speaking ? ' is-speaking' : '') +
+            (state === 'ready' ? ' is-ready' : ''),
+          onClick: speak,
+          title: busy ? '合成中…' : speaking ? '停止朗读' : state === 'ready' ? '点击播放' : '朗读这条回答',
+          'aria-label': '朗读这条回答',
+          disabled: !text,
+        },
+        busy ? '⏳' : speaking ? '⏹' : '🔊',
+      )
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // mimo_tts store-mode toolview: playable strip / card for agent speech
+    // ──────────────────────────────────────────────────────────────────────────
+    // The host render emits a machine envelope as a second text block:
+    // {path, bytes, audioUrl, seconds, inline}. inline=false renders a card.
+    function parseTtsEnvelope(content) {
+      if (!Array.isArray(content)) return null
+      for (const block of content) {
+        if (block && block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
+          try {
+            const v = JSON.parse(block.text)
+            if (v && typeof v === 'object' && typeof v.audioUrl === 'string') return v
+          } catch (_) { /* not our envelope */ }
+        }
+      }
+      return null
+    }
+    function formatDuration(seconds) {
+      const s = Math.max(0, Math.round(seconds || 0))
+      if (s < 60) return s + 's'
+      const m = Math.floor(s / 60)
+      const r = s % 60
+      return m + ':' + String(r).padStart(2, '0')
+    }
+
+    function MimoTtsView(props) {
+      const { block } = props
+      const [playing, setPlaying] = useState(false)
+      // The file may have been cleaned by an archived session / retention
+      // while the manifest entry (params) survives. probe:
+      // unknown | ok | cleaned | missing — resolved with a HEAD probe.
+      const [probe, setProbe] = useState('unknown')
+      const [regenerating, setRegenerating] = useState(false)
+      const audioRef = useRef(null)
+      const stopHandlerRef = useRef(null)
+      const playBtnRef = useRef(null)
+      const mountedRef = useRef(true)
+
+      const settled = block && block.kind === 'tool-result'
+      const envelope = settled ? parseTtsEnvelope(block.content) : null
+      const seconds = envelope && typeof envelope.seconds === 'number' ? envelope.seconds : 0
+      const inline = !envelope || envelope.inline !== false
+
+      // HEAD-probe the artifact once the call settles: 410 Gone = cleaned
+      // (entry survived, file gone) → '已清理,可重新生成'. Network failure or
+      // anything else leaves it playable (the <audio> element surfaces real
+      // load errors on play).
+      useEffect(() => {
+        if (!settled || !envelope) return
+        let alive = true
+        setProbe('unknown')
+        fetch(envelope.audioUrl, { method: 'HEAD', credentials: 'same-origin' })
+          .then((r) => {
+            if (!alive) return
+            setProbe(r.status === 410 ? 'cleaned' : r.status === 404 ? 'missing' : 'ok')
+          })
+          .catch(() => { if (alive) setProbe('ok'); })
+        return () => { alive = false }
+      }, [settled, envelope ? envelope.audioUrl : null])
+
+      // Re-synthesize a cleaned artifact from its manifest parameter record.
+      // The host rewrites the SAME id, so the strip's audioUrl stays valid and
+      // the play path just works again.
+      const regenerate = () => {
+        if (regenerating || !props.sessionId || !props.callId) return
+        setRegenerating(true)
+        fetch(REGENERATE_ROUTE, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: props.sessionId, callId: props.callId }),
+        })
+          .then((r) => r.json())
+          .then((d) => {
+            if (!d.ok) throw new Error((d.error && d.error.message) || 'regenerate failed')
+            setProbe('ok')
+          })
+          .catch((err) => {
+            window.alert('重新生成失败：' + ((err && err.message) || err))
+          })
+          .finally(() => { if (mountedRef.current) setRegenerating(false); })
+      }
+
+      useEffect(() => {
+        const handleStop = () => setPlaying(false)
+        stopHandlerRef.current = handleStop
+        audioStopListeners.add(handleStop)
+        return () => {
+          mountedRef.current = false
+          audioStopListeners.delete(handleStop)
+          const a = audioRef.current
+          if (a) {
+            try { a.pause(); a.removeAttribute('src'); } catch (_) { /* ignore */ }
+          }
+          if (activeAudio === a) activeAudio = null
+        }
+      }, [])
+
+      const startPlayback = () => {
+        if (!envelope) return
+        stopOthersExcept(stopHandlerRef.current)
+        const a = new Audio(envelope.audioUrl)
+        audioRef.current = a
+        activeAudio = a
+        const settle = () => {
+          if (mountedRef.current) setPlaying(false)
+          if (activeAudio === a) activeAudio = null
+        }
+        a.onended = settle
+        a.onerror = settle
+        const promise = a.play()
+        if (promise && typeof promise.catch === 'function') {
+          promise.catch(() => settle())
+        }
+        setPlaying(true)
+      }
+
+      const toggle = () => {
+        if (!envelope) return
+        if (playing) {
+          stopActiveAudio()
+          return
+        }
+        startPlayback()
+      }
+
+      // Fallback while running / when the envelope is missing: the plain text
+      // summary line, so the tool row never renders empty.
+      if (!envelope) {
+        const text = settled && Array.isArray(block.content)
+          ? block.content
+              .filter((b) => b && b.type === 'text' && b.text && !b.text.trim().startsWith('{'))
+              .map((b) => b.text)
+              .join(' ')
+          : ''
+        return React.createElement('div', { style: { fontSize: '12px', opacity: 0.75, padding: '4px 2px' } }, text || '…')
+      }
+
+      const downloadName = (envelope.path || 'mimo-tts.wav').split(/[\\/]/).pop()
+      const rowStyle = {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '8px',
+        padding: '8px 10px',
+        borderRadius: '8px',
+        border: '1px solid rgba(128,128,128,.25)',
+        background: 'rgba(128,128,128,.06)',
+        maxWidth: '100%',
+      }
+      const btnStyle = { background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '16px', lineHeight: 1, padding: '2px 4px' }
+      const controls = [
+        React.createElement('button', {
+          key: 'play',
+          ref: playBtnRef,
+          type: 'button',
+          onClick: toggle,
+          style: btnStyle,
+          title: playing ? '停止' : '播放',
+          'aria-label': playing ? '停止' : '播放',
+        }, playing ? '⏸' : '▶'),
+        React.createElement('span', { key: 'dur', style: { fontSize: '12px', opacity: 0.75, minWidth: '44px' } }, formatDuration(seconds)),
+        React.createElement('a', {
+          key: 'dl',
+          href: envelope.audioUrl,
+          download: downloadName,
+          style: { ...btnStyle, textDecoration: 'none', fontSize: '13px' },
+          title: '下载',
+        }, '⬇'),
+      ]
+      if (probe === 'cleaned' || probe === 'missing') {
+        // The artifact was cleaned (archived session / retention); the
+        // manifest entry still carries the synthesis parameters, so a
+        // '重新生成' button restores it in place.
+        return React.createElement('div', {
+          style: { ...rowStyle, justifyContent: 'space-between', flexWrap: 'wrap' },
+        },
+          React.createElement('span', { style: { fontSize: '12px', opacity: 0.75 } },
+            probe === 'missing' ? '音频缺失' : '已清理,可重新生成'),
+          React.createElement('button', {
+            type: 'button',
+            onClick: regenerate,
+            disabled: regenerating || !props.sessionId || !props.callId,
+            style: { ...btnStyle, fontSize: '12px', whiteSpace: 'nowrap' },
+            title: regenerating ? '重新生成中…' : '用原参数重新合成',
+            'aria-label': '重新生成',
+          }, regenerating ? '⏳ 生成中…' : '↻ 重新生成'),
+        )
+      }
+      if (inline) {
+        return React.createElement('div', { style: rowStyle }, controls)
+      }
+      // Long speech (inline=false from the host, Config audio.inlineThreshold)
+      // renders as a distinct card.
+      return React.createElement('div', {
+        style: { ...rowStyle, flexDirection: 'column', alignItems: 'stretch', padding: '10px 12px', background: 'rgba(128,128,128,.09)' },
+      },
+        React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px', opacity: 0.7 } },
+          React.createElement('span', null, 'Agent 语音'),
+          React.createElement('span', null, formatDuration(seconds)),
+        ),
+        React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, controls),
+      )
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Plugin body
+    // ──────────────────────────────────────────────────────────────────────────
+    function apply(ctx) {
+      // One shared style tag, removed on unload.
+      let styleEl = document.getElementById('dsh-mimo-voice-style')
+      if (!styleEl) {
+        styleEl = document.createElement('style')
+        styleEl.id = 'dsh-mimo-voice-style'
+        styleEl.textContent = [
+          '.dsh-voice-btn{',
+          '  appearance:none;background:transparent;border:1px solid transparent;',
+          '  border-radius:6px;cursor:pointer;font-size:14px;line-height:1;',
+          '  padding:4px 6px;opacity:.7;transition:opacity .12s, background .12s, border-color .12s;',
+          '}',
+          '.dsh-voice-btn:hover{opacity:1;background:rgba(128,128,128,.12)}',
+          '.dsh-voice-btn:disabled{opacity:.3;cursor:default}',
+          '.dsh-voice-btn.is-listening,.dsh-voice-btn.is-speaking{',
+          '  color:#e5484d;border-color:#e5484d;opacity:1;',
+          '}',
+          '.dsh-voice-btn.is-ready{',
+          '  color:#e5a03d;border-color:#e5a03d;opacity:1;',
+          '}',
+        ].join('\n')
+        document.head.append(styleEl)
+      }
+      ctx.effect(() => {
+        return () => {
+          if (styleEl && styleEl.isConnected) styleEl.remove()
+        }
+      }, 'dsh-mimo-agent-tools: remove voice styles')
+
+      ctx.slots.inject('conversation.chat.assistant-actions', () => {
+        const dispose = ctx.slots.register(
+          { name: 'conversation.chat.assistant-actions', id: 'dsh-mimo-speaker', order: 30 },
+          SpeakerButton,
+        )
+        return () => dispose()
+      })
+
+      // Stored mimo_tts speech renders as a playable strip / card inside the
+      // tool row — keyed slot dispatched by the wire tool name.
+      ctx.slots.inject('tool.call.toolview', () => ctx.slots.register(
+        { name: 'tool.call.toolview', key: 'mimo_tts', order: 30 },
+        MimoTtsView,
+      ))
+
+      // Archive cleanup. The `host/archived-sessions-changed` frame reaches
+      // the CLIENT runtime only (api-proxy pushes it to client mux queues,
+      // not the host cordis bus), so this half diffs the full
+      // archivedSessionIds set off ctx.workspaces.list and drives the host
+      // cleanup route for each newly archived session. A fresh snapshot on
+      // (re)load yields no "added" ids — only real transitions clean.
+      ctx.effect(() => {
+        let dispose = null
+        try {
+          const ws = ctx.workspaces
+          if (ws && ws.list && typeof ws.list.subscribe === 'function') {
+            let last = new Set(ws.list.getSnapshot().archivedSessionIds || [])
+            const onChange = () => {
+              let snapshot
+              try { snapshot = ws.list.getSnapshot(); } catch (_) { return; }
+              const cur = new Set(snapshot.archivedSessionIds || [])
+              const added = Array.from(cur).filter((id) => !last.has(id))
+              last = cur
+              if (added.length === 0) return
+              fetch(ARCHIVE_CLEANUP_ROUTE, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sessionIds: added }),
+              }).catch(() => { /* cleanup retries at the next transition */ })
+            }
+            dispose = ws.list.subscribe(onChange)
+          }
+        } catch (_) { /* best-effort: the host startup sweep still covers it */ }
+        return () => {
+          if (dispose) { try { dispose(); } catch (_) { /* ignore */ } }
+        }
+      }, 'dsh-mimo-agent-tools: archived-session cleanup watcher')
+    }
+
+    exports.inject = inject
+    exports.apply = apply
+    return module.exports
+  },
+})

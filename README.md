@@ -2,7 +2,11 @@
 
 DSH (DeepSeek Harness) Cordis plugin that turns the **Xiaomi MiMo API** into
 model tools for an agent: web search, image/audio/video understanding,
-speech-to-text, and text-to-speech.
+speech-to-text, and text-to-speech — plus, since the single-repo merge
+(`docs/adr/0001`, absorbing dsh-voice-mimo), the **voice UI**: a 🔊 read-aloud
+button on every assistant reply, in-conversation speech strips for stored
+`mimo_tts` output (play / download / regenerate), and a configurable voice
+map in the Plugins settings tab.
 
 Backed by the OpenAI-compatible endpoint `https://api.xiaomimimo.com/v1`.
 
@@ -17,7 +21,7 @@ Backed by the OpenAI-compatible endpoint `https://api.xiaomimimo.com/v1`.
 | `mimo_audio` | mimo-v2.6 | Audio understanding / transcription (wav/mp3/flac/ogg/m4a) — local file or public URL |
 | `mimo_video` | mimo-v2.5 | Video understanding (mp4/webm/mov) — local file or public URL; optional `fps` / `media_resolution` |
 | `mimo_asr` | mimo-v2.5-asr | Speech-to-text with optional language hint — local file or public URL |
-| `mimo_tts` | mimo-v2.5-tts / -voicedesign | Text-to-speech to a `.wav`/`.mp3` file — preset voices or free-form voice design; optional `style` (speaking tone) and `format` (wav/mp3) |
+| `mimo_tts` | mimo-v2.5-tts / -voicedesign | Text-to-speech to a `.wav`/`.mp3` file — preset voices or free-form voice design; optional `style` (speaking tone) and `format` (wav/mp3). With `store: true` the audio lands in the plugin audio store and a playable strip (play/download/regenerate) renders in the conversation (voice/style default to the plugin Config) |
 | `mimo_voiceclone` | mimo-v2.5-tts-voiceclone | Voice cloning — reference clip + text → speech in that voice; optional `format` (wav/mp3) |
 
 ## audio-tools skill
@@ -118,20 +122,21 @@ node_modules where peer deps resolve against the running harness.
 ```bash
 python3 tests/test_driver.py      # driver request-body assembly (14 cases)
 node --test tests/tools.test.mjs  # tool registration surface
-node --test tests/client.test.mjs # ./client TTS/ASR client (mocked fetch)
+node --test tests/mimo.test.mjs   # ./mimo TTS/ASR client (mocked fetch)
 node --test tests/speech.test.mjs # speechToText provider surface
 ```
 
-## Reusable MiMo client (`./client`)
+## Reusable MiMo client (`./mimo`)
 
-`client.js` exports a **ctx-light** MiMo TTS/ASR client — plain node fetch,
+`mimo.js` exports a **ctx-light** MiMo TTS/ASR client — plain node fetch,
 no shell/sandbox/credentials coupling (pass the `apiKey` yourself; inject
 `fetchImpl` in tests). The python-driver tools above are untouched; this
-entry exists for host-side consumers such as dsh-voice-mimo's read-aloud UI
-(single MiMo transport — see `docs/adr/0001`):
+entry exists for host-side consumers such as the merged voice UI's read-aloud
+routes (single MiMo transport — see `docs/adr/0001`; the `./client` export is
+reserved for the browser UI entry per the DSH client-bundler convention):
 
 ```js
-import { createMiMoClient } from 'dsh-mimo-agent-tools/client'
+import { createMiMoClient } from 'dsh-mimo-agent-tools/mimo'
 const mimo = createMiMoClient({ apiKey: '...' })
 const { bytes } = await mimo.speak({ voice: 'Mia', text: '你好' })          // preset
 await mimo.speak({ voice: '温柔的女声', text: 'hi', style: '轻快' })         // voicedesign
@@ -142,6 +147,32 @@ await mimo.transcribe({ audio: base64Wav, language: 'zh' })
 Voice-map semantics (`preset` / `voicedesign` / `voiceclone` resolution via
 `resolveTtsTarget`, style channeling via `applyStyle`) stay
 caller-configurable — pass your own `voiceMap`.
+
+## Voice UI (merged from dsh-voice-mimo)
+
+The `./client` entry is the browser half (DSH client-bundler convention,
+`dsh.client` in package.json):
+
+- **🔊 read-aloud** — a speaker button on every assistant reply; the host
+  synthesizes through the shared `./mimo` client and the browser plays the
+  same-origin audio.
+- **Speech strips** — `mimo_tts` with `store: true` stores the artifact
+  (`<dshHome>/cache/dsh-mimo-agent-tools/long/` + manifest) and renders a
+  play / download / regenerate strip in the conversation.
+- **Retention** — artifacts of archived sessions are cleaned (client watcher
+  + host startup sweep); a loose count/days fallback bounds the store. The
+  manifest record survives cleanup so 「↻ 重新生成」 can replay the exact
+  request.
+
+Configuration (voice map, 朗读音色/朗读语气, audio dir, retention, inline
+threshold) lives in the plugin **Config**, surfaced through the Plugins
+settings tab.
+
+Dropped with the merge (issue #4): the 🎤 mic button (covered by the official
+speechToText provider in `./speech`), the understand-audio composer button
+(`mimo_audio` is the agent-side path), the voice_transcribe / voice_understand
+/ voice_speak tools (functional duplicates of mimo_asr / mimo_audio /
+mimo_tts), and auto read-aloud notifications (never used).
 
 ## Official voice input (speechToText provider)
 

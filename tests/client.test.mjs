@@ -1,4 +1,4 @@
-// Tests for the ./client export — the ctx-light MiMo TTS/ASR client.
+// Tests for the ./mimo export — the ctx-light MiMo TTS/ASR client.
 // No network: fetch is injected; every assertion inspects the request the
 // client builds or the value it returns (mirrors dsh-voice-mimo semantics,
 // which this module absorbs per docs/adr/0001).
@@ -14,7 +14,7 @@ import {
   applyStyle,
   truncateTtsText,
   toDataUrl,
-} from '../client.js'
+} from '../mimo.js'
 
 const AUDIO_B64 = Buffer.from('RIFF0000WAVEfmt ').toString('base64')
 
@@ -179,4 +179,33 @@ test('transcribe: no language → no asr_options key', async () => {
 test('transcribe: non-ok response rejects', async () => {
   const { client } = clientWith({ ok: false, status: 500, text: 'boom' })
   await assert.rejects(() => client.transcribe({ audio: AUDIO_B64 }), /HTTP 500/)
+})
+
+// ── speakResolved: pre-resolved target transport (web routes / store mode) ──
+
+test('speakResolved: posts the given model/messages/audio verbatim, returns bytes', async () => {
+  const { calls, client } = clientWith({ json: { choices: [{ message: { audio: { data: Buffer.from('RIFF').toString('base64') } } }] } })
+  const out = await client.speakResolved({
+    model: 'mimo-v2.5-tts',
+    userContent: '温柔',
+    text: '你好',
+    audio: { format: 'wav', voice: '冰糖' },
+  })
+  assert.equal(Buffer.isBuffer(out.bytes), true)
+  assert.equal(out.mime, 'audio/wav')
+  const body = JSON.parse(calls[0].init.body)
+  assert.deepEqual(body.messages, [
+    { role: 'user', content: '温柔' },
+    { role: 'assistant', content: '你好' },
+  ])
+  assert.deepEqual(body.audio, { format: 'wav', voice: '冰糖' })
+  assert.equal(body.model, 'mimo-v2.5-tts')
+})
+
+test('speakResolved: no audio data → error; mp3 format → audio/mpeg mime', async () => {
+  const a = clientWith({ json: { choices: [{ message: {} }] } })
+  await assert.rejects(a.client.speakResolved({ model: 'm', userContent: 'u', text: 't', audio: { format: 'wav' } }), /no audio data/)
+  const b = clientWith({ json: { choices: [{ message: { audio: { data: Buffer.from('x').toString('base64') } } }] } })
+  const out = await b.client.speakResolved({ model: 'm', userContent: 'u', text: 't', audio: { format: 'mp3' } })
+  assert.equal(out.mime, 'audio/mpeg')
 })
