@@ -6,7 +6,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { apply, name, inject } from '../index.js'
+import { apply, name, inject, DEFAULT_AUDIO_MODEL } from '../index.js'
 
 function makeCtx() {
   const registered = []
@@ -75,6 +75,13 @@ test('mimo_voiceclone exposes format (wav/mp3)', () => {
   assert.equal(p.format.type, 'string')
   assert.ok(p.format.description.includes('wav'))
   assert.ok(p.format.description.includes('mp3'))
+})
+
+test('mimo_audio default model is V2.6 (v2.5 offline 2026-10-21)', () => {
+  assert.equal(DEFAULT_AUDIO_MODEL, 'mimo-v2.6')
+  assert.ok(byName.mimo_audio.description.includes('mimo-v2.6'), 'description should name the V2.6 default')
+  // ASR/TTS v2.5 lines stay current — only audio understanding migrates.
+  assert.ok(byName.mimo_asr.description.includes('mimo-v2.5-asr'))
 })
 
 test('audio + asr descriptions claim URL support (now true)', () => {

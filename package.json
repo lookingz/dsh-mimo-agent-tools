@@ -6,11 +6,13 @@
   "main": "index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./speech": "./speech.js",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
+    "client.js",
     "speech.js",
     "cordis.patch.yml",
     "driver/mimo_driver.py",

@@ -14,7 +14,7 @@ Backed by the OpenAI-compatible endpoint `https://api.xiaomimimo.com/v1`.
 | `mimo_think` | mimo-v2.5-pro / mimo-v2.5 | Deep thinking — full reasoning chain (`reasoning_content`) + final answer |
 | `mimo_json` | mimo-v2.5-pro / mimo-v2.5 | Structured JSON output via `response_format: json_object` |
 | `mimo_vision` | mimo-v2.5 | Image understanding — local files (auto base64) or public URLs, multi-image |
-| `mimo_audio` | mimo-v2.5 | Audio understanding / transcription (wav/mp3/flac/ogg/m4a) — local file or public URL |
+| `mimo_audio` | mimo-v2.6 | Audio understanding / transcription (wav/mp3/flac/ogg/m4a) — local file or public URL |
 | `mimo_video` | mimo-v2.5 | Video understanding (mp4/webm/mov) — local file or public URL; optional `fps` / `media_resolution` |
 | `mimo_asr` | mimo-v2.5-asr | Speech-to-text with optional language hint — local file or public URL |
 | `mimo_tts` | mimo-v2.5-tts / -voicedesign | Text-to-speech to a `.wav`/`.mp3` file — preset voices or free-form voice design; optional `style` (speaking tone) and `format` (wav/mp3) |
@@ -117,9 +117,31 @@ node_modules where peer deps resolve against the running harness.
 
 ```bash
 python3 tests/test_driver.py      # driver request-body assembly (14 cases)
-node --test tests/tools.test.mjs  # tool registration surface (10 cases)
-node --test tests/speech.test.mjs # speechToText provider surface (4 cases)
+node --test tests/tools.test.mjs  # tool registration surface
+node --test tests/client.test.mjs # ./client TTS/ASR client (mocked fetch)
+node --test tests/speech.test.mjs # speechToText provider surface
 ```
+
+## Reusable MiMo client (`./client`)
+
+`client.js` exports a **ctx-light** MiMo TTS/ASR client — plain node fetch,
+no shell/sandbox/credentials coupling (pass the `apiKey` yourself; inject
+`fetchImpl` in tests). The python-driver tools above are untouched; this
+entry exists for host-side consumers such as dsh-voice-mimo's read-aloud UI
+(single MiMo transport — see `docs/adr/0001`):
+
+```js
+import { createMiMoClient } from 'dsh-mimo-agent-tools/client'
+const mimo = createMiMoClient({ apiKey: '...' })
+const { bytes } = await mimo.speak({ voice: 'Mia', text: '你好' })          // preset
+await mimo.speak({ voice: '温柔的女声', text: 'hi', style: '轻快' })         // voicedesign
+await mimo.speak({ voice: 'me', voiceMap, reference: dataUrl, text: '...' }) // voiceclone
+await mimo.transcribe({ audio: base64Wav, language: 'zh' })
+```
+
+Voice-map semantics (`preset` / `voicedesign` / `voiceclone` resolution via
+`resolveTtsTarget`, style channeling via `applyStyle`) stay
+caller-configurable — pass your own `voiceMap`.
 
 ## Official voice input (speechToText provider)
 

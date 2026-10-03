@@ -16,6 +16,14 @@ export const name = 'dsh-mimo-agent-tools'
 export const inject = ['tools', 'shell', 'sandboxPolicy', 'credentials', 'skills']
 
 /**
+ * Default model for mimo_audio (audio understanding). Migrated from
+ * mimo-v2.5 (offline 2026-10-21 10:00 UTC+8, absorbed from dsh-voice-mimo
+ * #15). The ASR (mimo-v2.5-asr) and TTS (mimo-v2.5-tts/-voicedesign/
+ * -voiceclone) lines stay current — only audio understanding moves.
+ */
+export const DEFAULT_AUDIO_MODEL = 'mimo-v2.6'
+
+/**
  * Shared MiMo runtime: shell pipeline (Git Bash routing, python driver spec
  * files), credential resolution, and the runDriver call every MiMo API
  * request goes through. Extracted to module scope so sibling plugin entries
@@ -290,7 +298,7 @@ export function apply(ctx) {
     },
     {
       name: 'mimo_audio',
-      description: 'Analyze audio content with the Xiaomi MiMo model (mimo-v2.5). Accepts a local file path (Windows or WSL path; auto base64) or a public URL. Supports wav/mp3/flac/ogg/m4a.',
+      description: 'Analyze audio content with the Xiaomi MiMo model (mimo-v2.6). Accepts a local file path (Windows or WSL path; auto base64) or a public URL. Supports wav/mp3/flac/ogg/m4a.',
       parameters: {
         audio: { type: 'string', required: true, description: 'Local audio file path or public URL' },
         prompt: { type: 'string', description: 'What to do with the audio (default: transcribe)' }
@@ -299,7 +307,7 @@ export function apply(ctx) {
       async execute(args, exec) {
         const isUrl = /^https?:\/\//.test(args.audio) || /^data:/.test(args.audio)
         const res = await runDriver({
-          model: 'mimo-v2.5', kind: 'audio',
+          model: DEFAULT_AUDIO_MODEL, kind: 'audio',
           files: isUrl ? [] : [{ kind: 'audio', mime: mimeOf(args.audio), path: winPathOf(args.audio) }],
           urls: isUrl ? [args.audio] : [],
           prompt: args.prompt || 'Please transcribe the audio content.'
