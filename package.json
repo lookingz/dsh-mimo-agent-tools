@@ -1,23 +1,48 @@
 {
   "name": "dsh-mimo-agent-tools",
-  "version": "0.1.1",
-  "description": "Xiaomi MiMo search + multimodal tools for DSH agents: mimo_search/vision/audio/video/asr/tts.",
+  "version": "0.2.1-alpha.1-r2",
+  "description": "Xiaomi MiMo search + multimodal tools for DSH agents (mimo_search/vision/audio/video/asr/tts) plus the merged voice UI: 🔊 read-aloud, in-conversation speech strips, and a configurable voice map (docs/adr/0001).",
   "type": "module",
   "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./mimo": "./mimo.js",
+    "./speech": "./speech.js",
+    "./package.json": "./package.json"
+  },
   "files": [
     "index.js",
+    "client.js",
+    "mimo.js",
+    "speech.js",
+    "web.js",
+    "audio-store.js",
     "cordis.patch.yml",
     "driver/mimo_driver.py",
     "README.md",
     "LICENSE"
   ],
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  },
   "license": "MIT",
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": "*"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "react",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-api-workspace-controller",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-home-paths": "0.2.1-alpha.1",
+    "@deepseek-ai/schemastery": "^3.18.4"
   }
 }

@@ -1,5 +1,22 @@
-# mimo-agent-tools bundle patch: registers the MiMo tools.
+# mimo-agent-tools bundle patch: registers the MiMo tools + the official
+# speechToText MiMo provider.
 # Installed via `dsh plugin --profile <name> add .` from this directory.
+#
+# The speech-to-text override below retargets the OFFICIAL voice-input
+# stack's default provider to MiMo. Layering: the override only lands on an
+# already-inserted row, so this bundle must compose AFTER
+# @deepseek-ai/dsh-experimental-voice-input-bundle in dsh.profile.bundles;
+# the name guard makes a missing/renamed base row skip loudly instead of
+# reconfiguring an unrelated entry.
 - insert:
     - id: mimo-agent-tools
       name: dsh-mimo-agent-tools
+    - id: mimo-speech
+      name: dsh-mimo-agent-tools/speech
+      # Dormant where the experimental voice-input bundle is absent
+      # (inject waits for the speechToText service); the tools entry above
+      # is unaffected.
+- id: speech-to-text
+  name: '@deepseek-ai/dsh-experimental-speech-to-text'
+  config:
+    defaultProvider: mimo
